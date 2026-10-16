@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from app.aniimo.providers import build_provider
 from app.aniimo.store import StoreService
@@ -44,16 +42,6 @@ app = FastAPI(
 
 app.include_router(verify.router)
 app.include_router(order.router)
-
-# --- Demo storefront tool (the "เครื่องมือร้าน" 4-step UID flow) ----------
-_STATIC = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=_STATIC), name="static")
-
-
-@app.get("/", include_in_schema=False)
-@app.get("/demo", include_in_schema=False)
-async def demo() -> FileResponse:
-    return FileResponse(_STATIC / "index.html")
 
 
 @app.exception_handler(AniimoError)
