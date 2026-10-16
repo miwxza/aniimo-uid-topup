@@ -48,11 +48,21 @@ differently:
   is blocked (also `ORDER_RESULT_UNKNOWN`) until the order status is checked and
   the entry is resolved. This is what prevents a double charge after an
   ambiguous `place_order`.
+- **Replay is cheap and safe.** A completed order is cached with its character,
+  so an exact replay returns immediately **before any upstream call** — a
+  provider/catalogue outage during a resend cannot disturb the `done` entry.
+  `abort` only ever removes the `in_flight` slot it created, never a `done` or
+  `unknown` entry.
+- **Atomic reservation.** Admission uses an atomic `INSERT … ON CONFLICT DO
+  NOTHING`, so two workers racing on the same key cannot both be admitted —
+  exactly one wins, the other is rejected.
 - **Durability.** State uses a pluggable backend: `sqlite` survives process
   restarts (`ANIIMO_IDEMPOTENCY_BACKEND=sqlite`), `memory` is for dev/tests. Use
-  Redis for a cluster — same contract. Only completed (`done`) entries age out
-  (`idempotency_done_ttl`); `unknown` / `in_flight` entries are **never**
-  TTL-expired, so an unconfirmed order cannot silently become resendable.
+  Redis for a cluster — same contract. **Production refuses `memory`** (startup
+  fails) so order state is never lost on restart. Only completed (`done`)
+  entries age out (`idempotency_done_ttl`); `unknown` / `in_flight` entries are
+  **never** TTL-expired, so an unconfirmed order cannot silently become
+  resendable.
 
 ## Circuit breaker (per stage)
 

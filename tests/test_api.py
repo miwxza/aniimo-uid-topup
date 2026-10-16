@@ -299,6 +299,27 @@ async def test_livestore_refuses_mock_character():
         await store.prepare_order(char, pkg)
 
 
+@respx.mock
+def test_replay_ignores_provider_outage_and_keeps_done(live_mode):
+    # First order succeeds; a later provider outage must NOT re-place the order
+    # nor delete the cached 'done' entry.
+    respx.post(PARTNER).mock(side_effect=[_partner_role(), httpx.Response(500, text="down")])
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    po = respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json=_order_ok()))
+    payload = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "r-1"}
+    first = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert first.status_code == 200
+    # Resend while provider is down → must replay cached result without calling
+    # the provider or place_order again.
+    second = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert second.status_code == 200 and second.json()["order_id"] == "ORD123"
+    assert second.json()["character"]["role_name"] == "Sweettoast"
+    partner_calls = [c for c in respx.calls if c.request.url.host == "partner.example.test"]
+    assert len(partner_calls) == 1  # provider hit once (first order only)
+    assert po.call_count == 1       # order placed exactly once
+
+
 # --- unit: durable guard survives a 'restart' (sqlite) ----------------------
 def test_sqlite_guard_persists_unknown_across_restart(tmp_path):
     from app.aniimo.idempotency import OrderGuard, SqliteStateStore
@@ -314,7 +335,31 @@ def test_sqlite_guard_persists_unknown_across_restart(tmp_path):
         g2.begin("k", "fp")  # unknown state is still there, resend blocked
 
 
-def test_prod_plus_mock_fails_fast(monkeypatch):
+def test_sqlite_reserve_is_atomic_single_winner(tmp_path):
+    # Two guards (two 'workers') on one db: only one may win the same key.
+    from app.aniimo.idempotency import OrderGuard, SqliteStateStore
+    from app.errors import DuplicateOrderError
+
+    db = str(tmp_path / "state.db")
+    g1 = OrderGuard(SqliteStateStore(db))
+    g2 = OrderGuard(SqliteStateStore(db))
+    assert g1.begin("k", "fp") is None            # g1 wins the slot
+    with pytest.raises(DuplicateOrderError):
+        g2.begin("k", "fp")                       # g2 is rejected, not admitted
+
+
+def test_prod_plus_mock_fails_fast():
     from app.config import Settings
     with pytest.raises(Exception):
         Settings(env="prod", role_provider="mock")
+
+
+def test_prod_requires_durable_backend():
+    from app.config import Settings
+    with pytest.raises(Exception):
+        Settings(env="prod", role_provider="partner",
+                 partner_verify_url=PARTNER, idempotency_backend="memory")
+    # sqlite in prod is accepted
+    s = Settings(env="prod", role_provider="partner",
+                 partner_verify_url=PARTNER, idempotency_backend="sqlite")
+    assert s.idempotency_backend == "sqlite"

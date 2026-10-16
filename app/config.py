@@ -101,6 +101,13 @@ class Settings(BaseSettings):
                 "ANIIMO_ROLE_PROVIDER=mock is not allowed with ANIIMO_ENV=prod; "
                 "configure a real provider (partner|session)."
             )
+        # Order-dedupe state must be durable in production — memory is lost on
+        # restart and is not shared across workers.
+        if self.env == "prod" and self.idempotency_backend == "memory":
+            raise ValueError(
+                "ANIIMO_IDEMPOTENCY_BACKEND=memory is not allowed with ANIIMO_ENV=prod; "
+                "use a durable backend (sqlite, or Redis in a cluster)."
+            )
         return self
 
 

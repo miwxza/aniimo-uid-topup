@@ -27,7 +27,13 @@ from app.errors import (
     RateLimitedError,
     UpstreamUnavailableError,
 )
-from app.models import CreateOrderRequest, OrderResponse, Package, PackagesResponse
+from app.models import (
+    CharacterInfo,
+    CreateOrderRequest,
+    OrderResponse,
+    Package,
+    PackagesResponse,
+)
 from app.ratelimit import CircuitBreaker, TokenBucketLimiter
 from app.validation import normalize_server, normalize_uid
 
@@ -106,15 +112,17 @@ async def create_order(
     fp = order_fingerprint(uid, server, body.package_id, body.quantity)
     key = idempotency_key(uid, server, body.package_id, body.quantity, body.idempotency_key)
 
-    # Dedupe FIRST, before any upstream work, so a reused key with different data
-    # is rejected and an exact replay returns the cached result.
+    # Dedupe FIRST, before ANY upstream work. An exact replay of a completed
+    # order returns the cached result + cached character immediately — we never
+    # touch the provider, so a provider outage cannot disturb a 'done' entry.
     cached = guard.begin(key, fp)
+    if cached is not None:
+        return _to_response(cached.result, CharacterInfo(**(cached.character or {})))
 
-    # Resolve the character (read). Failure here is pre-dispatch → free the key.
+    # Fresh order. Reads here are pre-dispatch → on failure free the key (which
+    # only removes the in_flight slot we just created, never a 'done' entry).
     try:
         character = await _upstream(read_breaker, lambda: provider.resolve(uid, server))
-        if cached is not None:
-            return _to_response(cached, character)
         pkgs = await _upstream(read_breaker, lambda: store.list_packages(server, character.openid))
         package: Package | None = next((p for p in pkgs if p.package_id == body.package_id), None)
         if package is None:
@@ -139,7 +147,7 @@ async def create_order(
         guard.mark_unknown(key, fp)
         raise
 
-    guard.complete(key, fp, result)
+    guard.complete(key, fp, result, character.model_dump())
     return _to_response(result, character)
 
 

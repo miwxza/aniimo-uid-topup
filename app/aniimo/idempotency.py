@@ -2,16 +2,15 @@
 
 Design goals (from review):
 * An idempotency key is bound to a **fingerprint** of the order
-  (uid|server|package|quantity). Reusing a key with different data is a 409,
-  never a silent replay onto a different character/amount.
-* A failure that happens **after** place_order was dispatched (invalid response,
-  5xx, timeout) leaves the key in an ``unknown`` state — the outcome may have
-  succeeded upstream — so an identical resend is blocked until the order status
-  is checked and the entry is explicitly resolved.
-* State is **durable**: a ``sqlite`` backend survives process restarts; the
-  in-memory backend is for tests/dev. Swap for Redis in a cluster — same
-  contract. ``unknown`` / ``in_flight`` entries are **never** TTL-expired; only
-  completed (``done``) entries age out.
+  (uid|server|package|quantity). Reusing a key with different data is a 409.
+* A failure **after** place_order was dispatched leaves the key ``unknown`` —
+  the outcome may have succeeded upstream — so resends are blocked until the
+  status is checked. A replay of a completed order returns the cached result
+  (and the cached character) **without** re-running any upstream call.
+* Key reservation is **atomic** (``INSERT … ON CONFLICT DO NOTHING``) so two
+  workers racing on the same key cannot both be admitted.
+* State is **durable**: the ``sqlite`` backend survives restarts; ``unknown`` /
+  ``in_flight`` entries are never TTL-expired (only ``done`` ages out).
 """
 from __future__ import annotations
 
@@ -46,13 +45,22 @@ class Entry:
     status: Status
     fingerprint: str
     result: OrderResult | None
+    character: dict | None
     ts: float
 
 
 class StateStore(Protocol):
+    def reserve(self, key: str, entry: Entry) -> Entry | None:
+        """Atomically insert ``entry`` if the key is free.
+
+        Returns ``None`` when this caller won the slot, or the EXISTING entry
+        when the key was already taken.
+        """
+
     def get(self, key: str) -> Entry | None: ...
     def put(self, key: str, entry: Entry) -> None: ...
     def delete(self, key: str) -> None: ...
+    def delete_in_flight(self, key: str) -> None: ...
     def gc_done(self, older_than: float) -> None: ...
 
 
@@ -60,6 +68,14 @@ class MemoryStateStore:
     def __init__(self) -> None:
         self._d: dict[str, Entry] = {}
         self._lock = threading.Lock()
+
+    def reserve(self, key: str, entry: Entry) -> Entry | None:
+        with self._lock:
+            existing = self._d.get(key)
+            if existing is not None:
+                return existing
+            self._d[key] = entry
+            return None
 
     def get(self, key: str) -> Entry | None:
         with self._lock:
@@ -73,6 +89,12 @@ class MemoryStateStore:
         with self._lock:
             self._d.pop(key, None)
 
+    def delete_in_flight(self, key: str) -> None:
+        with self._lock:
+            e = self._d.get(key)
+            if e is not None and e.status == "in_flight":
+                self._d.pop(key, None)
+
     def gc_done(self, older_than: float) -> None:
         now = time.time()
         with self._lock:
@@ -81,51 +103,74 @@ class MemoryStateStore:
 
 
 class SqliteStateStore:
-    """Durable state; survives restarts. Single-writer-safe via a lock."""
+    """Durable, atomic state. Safe for multiple workers sharing one db file."""
 
     def __init__(self, path: str) -> None:
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS order_state ("
-            "key TEXT PRIMARY KEY, status TEXT, fingerprint TEXT, result TEXT, ts REAL)"
+            "key TEXT PRIMARY KEY, status TEXT, fingerprint TEXT, "
+            "result TEXT, character TEXT, ts REAL)"
         )
-        self._conn.commit()
+
+    def _row_to_entry(self, row) -> Entry:
+        status, fp, result_json, char_json, ts = row
+        result = OrderResult(**json.loads(result_json)) if result_json else None
+        character = json.loads(char_json) if char_json else None
+        return Entry(status=status, fingerprint=fp, result=result, character=character, ts=ts)
+
+    def reserve(self, key: str, entry: Entry) -> Entry | None:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO order_state(key,status,fingerprint,result,character,ts) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO NOTHING",
+                (key, entry.status, entry.fingerprint, None, None, entry.ts),
+            )
+            if cur.rowcount == 1:
+                return None  # we won the slot
+            row = self._conn.execute(
+                "SELECT status, fingerprint, result, character, ts FROM order_state WHERE key=?",
+                (key,),
+            ).fetchone()
+            return self._row_to_entry(row) if row else None
 
     def get(self, key: str) -> Entry | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT status, fingerprint, result, ts FROM order_state WHERE key=?", (key,)
+                "SELECT status, fingerprint, result, character, ts FROM order_state WHERE key=?",
+                (key,),
             ).fetchone()
-        if not row:
-            return None
-        status, fp, result_json, ts = row
-        result = OrderResult(**json.loads(result_json)) if result_json else None
-        return Entry(status=status, fingerprint=fp, result=result, ts=ts)
+        return self._row_to_entry(row) if row else None
 
     def put(self, key: str, entry: Entry) -> None:
         result_json = json.dumps(asdict(entry.result)) if entry.result else None
+        char_json = json.dumps(entry.character) if entry.character else None
         with self._lock:
             self._conn.execute(
-                "INSERT INTO order_state(key,status,fingerprint,result,ts) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(key) DO UPDATE SET status=excluded.status, "
-                "fingerprint=excluded.fingerprint, result=excluded.result, ts=excluded.ts",
-                (key, entry.status, entry.fingerprint, result_json, entry.ts),
+                "INSERT INTO order_state(key,status,fingerprint,result,character,ts) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                "status=excluded.status, fingerprint=excluded.fingerprint, "
+                "result=excluded.result, character=excluded.character, ts=excluded.ts",
+                (key, entry.status, entry.fingerprint, result_json, char_json, entry.ts),
             )
-            self._conn.commit()
 
     def delete(self, key: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM order_state WHERE key=?", (key,))
-            self._conn.commit()
+
+    def delete_in_flight(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM order_state WHERE key=? AND status='in_flight'", (key,)
+            )
 
     def gc_done(self, older_than: float) -> None:
         cutoff = time.time() - older_than
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM order_state WHERE status='done' AND ts < ?", (cutoff,)
-            )
-            self._conn.commit()
+            self._conn.execute("DELETE FROM order_state WHERE status='done' AND ts < ?", (cutoff,))
 
 
 class OrderGuard:
@@ -133,43 +178,47 @@ class OrderGuard:
         self._store = store
         self._done_ttl = done_ttl
 
-    def begin(self, key: str, fingerprint: str) -> OrderResult | None:
-        """Admit an order. Returns a cached result for an exact replay, or raises.
-
-        * different data for the same key → ``IDEMPOTENCY_KEY_CONFLICT``
-        * already in flight → ``DUPLICATE_ORDER``
-        * previously left ``unknown`` → ``ORDER_RESULT_UNKNOWN`` (check status first)
+    def begin(self, key: str, fingerprint: str) -> Entry | None:
+        """Atomically admit an order. Returns the cached ``Entry`` for an exact
+        replay (caller reuses its stored result + character), or ``None`` when
+        this caller owns a fresh slot. Raises on conflict / in-flight / unknown.
         """
         self._store.gc_done(self._done_ttl)  # only completed entries age out
-        e = self._store.get(key)
-        if e is not None:
-            if e.fingerprint != fingerprint:
-                raise IdempotencyKeyConflictError(key)
-            if e.status == "done" and e.result is not None:
-                return e.result
-            if e.status == "unknown":
-                raise OrderResultUnknownError(key)
-            raise DuplicateOrderError(key)  # in_flight
-        self._store.put(key, Entry("in_flight", fingerprint, None, time.time()))
-        return None
+        reserved = Entry("in_flight", fingerprint, None, None, time.time())
+        existing = self._store.reserve(key, reserved)
+        if existing is None:
+            return None  # we own the slot — proceed with a fresh order
+        if existing.fingerprint != fingerprint:
+            raise IdempotencyKeyConflictError(key)
+        if existing.status == "done" and existing.result is not None:
+            return existing  # replay — NO upstream call needed
+        if existing.status == "unknown":
+            raise OrderResultUnknownError(key)
+        raise DuplicateOrderError(key)  # in_flight
 
-    def complete(self, key: str, fingerprint: str, result: OrderResult) -> None:
-        self._store.put(key, Entry("done", fingerprint, result, time.time()))
+    def complete(self, key: str, fingerprint: str, result: OrderResult, character: dict) -> None:
+        self._store.put(key, Entry("done", fingerprint, result, character, time.time()))
 
     def mark_unknown(self, key: str, fingerprint: str) -> None:
-        """Post-dispatch failure: keep the key so resends are blocked."""
-        self._store.put(key, Entry("unknown", fingerprint, None, time.time()))
+        """Post-dispatch failure: keep the key so resends stay blocked."""
+        self._store.put(key, Entry("unknown", fingerprint, None, None, time.time()))
 
     def abort(self, key: str) -> None:
-        """Pre-dispatch failure: the order was never sent, so the key is freed."""
-        self._store.delete(key)
+        """Pre-dispatch failure: free the key, but ONLY if still in_flight —
+        never removes a completed ('done') or 'unknown' entry."""
+        self._store.delete_in_flight(key)
 
-    def resolve(self, key: str, result: OrderResult | None, fingerprint: str = "") -> None:
-        """Clear an ``unknown`` entry after the order status has been checked."""
+    def resolve(self, key: str, result: OrderResult | None, fingerprint: str = "",
+                character: dict | None = None) -> None:
+        """Clear an 'unknown' entry after the order status has been checked.
+
+        ``result`` set → the order was confirmed created (cache it); ``None`` →
+        confirmed NOT created, free the key so it can be retried.
+        """
         if result is None:
             self._store.delete(key)
         else:
-            self.complete(key, fingerprint, result)
+            self.complete(key, fingerprint, result, character or {})
 
 
 def build_state_store(backend: str, db_path: str) -> StateStore:
