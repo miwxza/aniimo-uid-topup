@@ -117,7 +117,17 @@ async def create_order(
     # touch the provider, so a provider outage cannot disturb a 'done' entry.
     cached = guard.begin(key, fp)
     if cached is not None:
-        return _to_response(cached.result, CharacterInfo(**(cached.character or {})))
+        # A matching fingerprint guarantees this resend's uid/server equal the
+        # original order's, so a legacy 'done' entry with no stored character
+        # (migrated from an older db) is still replayed safely — we rebuild the
+        # identity from the request and flag the rest as unavailable rather than
+        # re-placing the order.
+        char_data = cached.character or {
+            "uid": uid,
+            "server": server,
+            "role_name": "(character unavailable — order from a previous version)",
+        }
+        return _to_response(cached.result, CharacterInfo(**char_data))
 
     # Fresh order. Reads here are pre-dispatch → on failure free the key (which
     # only removes the in_flight slot we just created, never a 'done' entry).

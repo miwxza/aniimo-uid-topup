@@ -63,6 +63,12 @@ differently:
   entries age out (`idempotency_done_ttl`); `unknown` / `in_flight` entries are
   **never** TTL-expired, so an unconfirmed order cannot silently become
   resendable.
+- **Schema migration.** On open, the sqlite store adds any missing columns via
+  `ALTER TABLE` (never dropping the db), so upgrading from an older version
+  keeps its `unknown`/`in_flight` dedupe history. A legacy `done` row that
+  predates character storage still replays safely: the identity is rebuilt from
+  the (fingerprint-matched) resend and the rest is flagged unavailable — the
+  order is never re-placed.
 
 ## Circuit breaker (per stage)
 

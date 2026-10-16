@@ -335,6 +335,49 @@ def test_sqlite_guard_persists_unknown_across_restart(tmp_path):
         g2.begin("k", "fp")  # unknown state is still there, resend blocked
 
 
+def test_sqlite_migrates_old_schema_without_data_loss(tmp_path):
+    # Reproduce an older db (round-2 schema, no 'character' column) holding an
+    # 'unknown' dedupe entry and a legacy 'done' order, then open it with the
+    # current store: it must ALTER (not crash) and keep both rows.
+    import sqlite3
+    import time
+
+    from app.aniimo.idempotency import OrderGuard, SqliteStateStore
+    from app.errors import OrderResultUnknownError
+
+    db = str(tmp_path / "old.db")
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE order_state ("
+        "key TEXT PRIMARY KEY, status TEXT, fingerprint TEXT, result TEXT, ts REAL)"
+    )
+    now = time.time()
+    con.execute("INSERT INTO order_state VALUES ('u','unknown','fp1',NULL,?)", (now,))
+    con.execute(
+        "INSERT INTO order_state VALUES ('d','done','fp2',?,?)",
+        ('{"order_id":"OLD1","status":"created","currency":"TWD","amount":138.0,"pay_url":null,"is_mock":false}', now),
+    )
+    con.commit()
+    con.close()
+
+    g = OrderGuard(SqliteStateStore(db))  # must migrate, not raise OperationalError
+
+    # Unknown dedupe history preserved → resend still blocked.
+    with pytest.raises(OrderResultUnknownError):
+        g.begin("u", "fp1")
+
+    # Legacy 'done' preserved and replayable; character is simply absent.
+    entry = g.begin("d", "fp2")
+    assert entry is not None and entry.result.order_id == "OLD1"
+    assert entry.character is None
+
+    # Writing a NEW entry into the migrated db works (the ALTER added 'character').
+    assert g.begin("n", "fp3") is None
+    g.mark_unknown("n", "fp3")
+    with pytest.raises(OrderResultUnknownError):
+        g.begin("n", "fp3")
+
+
 def test_sqlite_reserve_is_atomic_single_winner(tmp_path):
     # Two guards (two 'workers') on one db: only one may win the same key.
     from app.aniimo.idempotency import OrderGuard, SqliteStateStore

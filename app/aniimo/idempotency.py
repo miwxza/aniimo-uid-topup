@@ -105,6 +105,19 @@ class MemoryStateStore:
 class SqliteStateStore:
     """Durable, atomic state. Safe for multiple workers sharing one db file."""
 
+    # Expected columns and their SQL types. New columns are added to existing
+    # tables via ALTER (see _migrate) so an older database keeps its rows —
+    # dropping the db would discard the unknown/in_flight dedupe history that
+    # prevents duplicate orders.
+    _COLUMNS = {
+        "key": "TEXT PRIMARY KEY",
+        "status": "TEXT",
+        "fingerprint": "TEXT",
+        "result": "TEXT",
+        "character": "TEXT",
+        "ts": "REAL",
+    }
+
     def __init__(self, path: str) -> None:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -115,6 +128,24 @@ class SqliteStateStore:
             "key TEXT PRIMARY KEY, status TEXT, fingerprint TEXT, "
             "result TEXT, character TEXT, ts REAL)"
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring an older table up to the current schema without data loss.
+
+        A pre-'character' database (created by an earlier version) is upgraded
+        by adding the missing column via ALTER TABLE; every existing row —
+        including unknown/in_flight dedupe entries — is preserved. Legacy rows
+        get character = NULL, which the guard/route handle explicitly.
+        """
+        with self._lock:
+            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(order_state)")}
+            for col, decl in self._COLUMNS.items():
+                if col not in existing:
+                    # PRIMARY KEY cannot be added via ALTER, but 'key' always
+                    # exists (the table has a PK); only data columns are added.
+                    col_type = decl.replace(" PRIMARY KEY", "")
+                    self._conn.execute(f"ALTER TABLE order_state ADD COLUMN {col} {col_type}")
 
     def _row_to_entry(self, row) -> Entry:
         status, fp, result_json, char_json, ts = row
