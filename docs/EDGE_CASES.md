@@ -15,7 +15,8 @@ to a stable JSON contract:
 | `REGION_CURRENCY_MISMATCH` | 409 | Catalogue not priced in TWD (needs a Taiwan egress) |
 | `PAYMENT_CHANNEL_UNAVAILABLE` | 409 | Upstream does not offer MyCard for this context |
 | `DUPLICATE_ORDER` | 409 | Identical order already in flight (idempotency guard) |
-| `ORDER_RESULT_UNKNOWN` | 202 | place_order outcome unconfirmed (e.g. read timeout) — check status, do not resend |
+| `IDEMPOTENCY_KEY_CONFLICT` | 409 | Key reused with different order data |
+| `ORDER_RESULT_UNKNOWN` | 202 | place_order outcome unconfirmed (timeout / 5xx / bad response) — check status, do not resend |
 | `UPSTREAM_INVALID_RESPONSE` | 502 | Order "ok" but missing order_id / amount / currency per contract |
 | `MOCK_DATA_IN_LIVE_MODE` | 409 | Live order attempted from mock character data |
 | `RATE_LIMITED` | 429 | Our own per-client token bucket tripped |
@@ -28,15 +29,38 @@ to a stable JSON contract:
 
 ## Duplicate orders (idempotency)
 
-- Reads retry on connect/read failures; **order placement does not** — retry
-  policy is split per operation.
-- `place_order` is sent with an `Idempotency-Key` (client-supplied or derived
-  from `uid|server|package_id|quantity`). An in-memory `OrderGuard` rejects an
-  identical in-flight request (`DUPLICATE_ORDER`) and replays a just-completed
-  one instead of ordering twice. Back it with Redis for multi-node.
-- On a `place_order` **read timeout** the outcome is unknown, so the service
-  returns `ORDER_RESULT_UNKNOWN` (202), keeps the key in flight (blocking blind
-  resends), and the caller must query order status before retrying.
+The order flow is split into a **pre-dispatch** phase (character lookup,
+catalogue, region/channel enforcement — nothing sent yet) and a **dispatch**
+phase (`place_order` + response validation). The idempotency guard treats them
+differently:
+
+- **Key ↔ data binding.** The key (client-supplied or derived from
+  `uid|server|package_id|quantity`) is stored with a fingerprint of those
+  fields. Reusing a key with *different* data → `IDEMPOTENCY_KEY_CONFLICT`
+  (409); it is never replayed onto a different character/amount. An exact replay
+  of a completed order returns the cached result (one order, not two).
+- **Pre-dispatch failure** (validation, wrong currency, product not found,
+  circuit open before send) → the key is **freed**; the order was never sent, so
+  a corrected retry is allowed.
+- **Post-dispatch failure** (read timeout, 5xx, or a response that fails
+  validation) → the outcome is unknown, so the key is kept in an **`unknown`**
+  state and the call returns `ORDER_RESULT_UNKNOWN` (202). Any identical resend
+  is blocked (also `ORDER_RESULT_UNKNOWN`) until the order status is checked and
+  the entry is resolved. This is what prevents a double charge after an
+  ambiguous `place_order`.
+- **Durability.** State uses a pluggable backend: `sqlite` survives process
+  restarts (`ANIIMO_IDEMPOTENCY_BACKEND=sqlite`), `memory` is for dev/tests. Use
+  Redis for a cluster — same contract. Only completed (`done`) entries age out
+  (`idempotency_done_ttl`); `unknown` / `in_flight` entries are **never**
+  TTL-expired, so an unconfirmed order cannot silently become resendable.
+
+## Circuit breaker (per stage)
+
+Reads and order placement have **separate** breakers, so a run of successful
+reads can no longer reset the failure count that order placement is
+accumulating. Repeated `place_order` faults open the *order* breaker
+independently and short-circuit further placements (pre-dispatch, so the key is
+freed), while reads stay available.
 
 ## Region / currency / channel enforcement
 

@@ -49,11 +49,17 @@ never diverge:
   upstream** (`REGION_CURRENCY_MISMATCH` / `PAYMENT_CHANNEL_UNAVAILABLE`),
   dedupes with an idempotency guard, and **validates the order response** before
   reporting success (`UPSTREAM_INVALID_RESPONSE`).
+- **Idempotency** (`app/aniimo/idempotency.py`) — order dedupe bound to an
+  order fingerprint (key reuse with different data → `409`), a durable backend
+  (`memory` or `sqlite`, Redis-ready), and a two-phase order flow: a failure
+  *after* `place_order` is sent keeps the key `unknown` (resends blocked, never
+  TTL-expired) so an ambiguous order can't be double-charged.
 - **Resilience** (`app/ratelimit.py`, `app/errors.py`) — per-client token
-  bucket (X-Forwarded-For trusted only from configured proxies), a circuit
-  breaker that counts only upstream faults, split read-vs-order retry (an order
-  read-timeout is reported `ORDER_RESULT_UNKNOWN`, never auto-resent), and a
-  stable error contract. See [`docs/EDGE_CASES.md`](docs/EDGE_CASES.md).
+  bucket (X-Forwarded-For trusted only from configured proxies), **per-stage**
+  circuit breakers (reads vs order placement) that count only upstream faults,
+  split read-vs-order retry (an order read-timeout is reported
+  `ORDER_RESULT_UNKNOWN`, never auto-resent), and a stable error contract. See
+  [`docs/EDGE_CASES.md`](docs/EDGE_CASES.md).
 
 ### What is actually tested vs pending
 
@@ -165,7 +171,8 @@ app/
   aniimo/
     client.py        low-level upstream HTTP client (envelope, retries, unwrap)
     providers.py     RoleProvider strategies (partner | session | mock)
-    store.py         catalogue + openid-bound order
+    store.py         catalogue + two-phase openid order (prepare/dispatch)
+    idempotency.py   dedupe guard (fingerprint, durable, unknown-state)
   routes/
     verify.py        POST /verify
     order.py         GET /packages, POST /order

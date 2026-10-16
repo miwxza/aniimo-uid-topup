@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from fastapi import Request
 
+from app.aniimo.idempotency import OrderGuard
 from app.aniimo.providers import RoleProvider
-from app.aniimo.store import OrderGuard, Store
+from app.aniimo.store import Store
 from app.config import Settings
 from app.ratelimit import CircuitBreaker, TokenBucketLimiter
 
@@ -25,8 +26,12 @@ def get_limiter(request: Request) -> TokenBucketLimiter:
     return request.app.state.limiter
 
 
-def get_breaker(request: Request) -> CircuitBreaker:
-    return request.app.state.breaker
+def get_read_breaker(request: Request) -> CircuitBreaker:
+    return request.app.state.read_breaker
+
+
+def get_order_breaker(request: Request) -> CircuitBreaker:
+    return request.app.state.order_breaker
 
 
 def get_guard(request: Request) -> OrderGuard:

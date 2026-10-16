@@ -5,15 +5,17 @@ from typing import Awaitable, Callable, TypeVar
 
 from fastapi import APIRouter, Depends, Request
 
+from app.aniimo.idempotency import OrderGuard
 from app.aniimo.providers import RoleProvider
-from app.aniimo.store import Store, OrderGuard, idempotency_key
+from app.aniimo.store import Store, idempotency_key, order_fingerprint
 from app.config import Settings
 from app.deps import (
     client_key,
-    get_breaker,
     get_guard,
     get_limiter,
+    get_order_breaker,
     get_provider,
+    get_read_breaker,
     get_settings,
     get_store,
 )
@@ -33,9 +35,8 @@ router = APIRouter(prefix="/api/v1/aniimo", tags=["order"])
 
 T = TypeVar("T")
 
-# Only genuine upstream-health failures should open the circuit breaker;
-# validation / business rejects (bad UID, wrong currency, product not found)
-# must not.
+# Only genuine upstream-health failures should open a circuit breaker; validation
+# / business rejects (bad UID, wrong currency, product not found) must not.
 _UPSTREAM_FAULTS = (
     UpstreamUnavailableError,
     CaptchaRequiredError,
@@ -44,13 +45,12 @@ _UPSTREAM_FAULTS = (
 )
 
 
-async def _upstream(breaker: CircuitBreaker, make: Callable[[], Awaitable[T]]) -> T:
-    """Run an upstream call behind the breaker, counting only upstream faults.
+def _admit(breaker: CircuitBreaker) -> None:
+    breaker.before()  # raises UpstreamUnavailableError when the circuit is open
 
-    Takes a factory so the coroutine is created only after the breaker admits
-    the call (no un-awaited coroutine when the circuit is open).
-    """
-    breaker.before()  # may raise UpstreamUnavailableError if circuit is open
+
+async def _run(breaker: CircuitBreaker, make: Callable[[], Awaitable[T]]) -> T:
+    """Execute an already-admitted upstream call, recording breaker outcome."""
     try:
         result = await make()
     except _UPSTREAM_FAULTS:
@@ -61,10 +61,14 @@ async def _upstream(breaker: CircuitBreaker, make: Callable[[], Awaitable[T]]) -
             breaker.record_failure()
         raise
     except Exception:
-        # App/business error — upstream is healthy, don't penalise it.
-        raise
+        raise  # business/app error — upstream is healthy
     breaker.record_success()
     return result
+
+
+async def _upstream(breaker: CircuitBreaker, make: Callable[[], Awaitable[T]]) -> T:
+    _admit(breaker)
+    return await _run(breaker, make)
 
 
 @router.get("/packages", response_model=PackagesResponse)
@@ -74,11 +78,11 @@ async def packages(
     store: Store = Depends(get_store),
     settings: Settings = Depends(get_settings),
     limiter: TokenBucketLimiter = Depends(get_limiter),
-    breaker: CircuitBreaker = Depends(get_breaker),
+    read_breaker: CircuitBreaker = Depends(get_read_breaker),
 ) -> PackagesResponse:
     limiter.check(f"packages:{client_key(request)}")
     server = normalize_server(server)
-    pkgs = await _upstream(breaker, lambda: store.list_packages(server))
+    pkgs = await _upstream(read_breaker, lambda: store.list_packages(server))
     currency = pkgs[0].currency if pkgs else settings.expected_currency
     return PackagesResponse(
         currency=currency, payment_channel=settings.payment_channel_id, packages=pkgs
@@ -91,48 +95,51 @@ async def create_order(
     request: Request,
     provider: RoleProvider = Depends(get_provider),
     store: Store = Depends(get_store),
-    settings: Settings = Depends(get_settings),
     limiter: TokenBucketLimiter = Depends(get_limiter),
-    breaker: CircuitBreaker = Depends(get_breaker),
+    read_breaker: CircuitBreaker = Depends(get_read_breaker),
+    order_breaker: CircuitBreaker = Depends(get_order_breaker),
     guard: OrderGuard = Depends(get_guard),
 ) -> OrderResponse:
     limiter.check(f"order:{client_key(request)}")
     uid = normalize_uid(body.uid)
     server = normalize_server(body.server)
-
-    # 1. Verify the character (yields the openid needed to bind the order).
-    character = await _upstream(breaker, lambda: provider.resolve(uid, server))
-
-    # 2. Dedupe guard — identical in-flight request is rejected; a completed one
-    #    replays its cached result instead of ordering again.
+    fp = order_fingerprint(uid, server, body.package_id, body.quantity)
     key = idempotency_key(uid, server, body.package_id, body.quantity, body.idempotency_key)
-    cached = guard.begin(key)
-    if cached is not None:
-        return _to_response(cached, character)
 
+    # Dedupe FIRST, before any upstream work, so a reused key with different data
+    # is rejected and an exact replay returns the cached result.
+    cached = guard.begin(key, fp)
+
+    # Resolve the character (read). Failure here is pre-dispatch → free the key.
     try:
-        # 3. Resolve the package from the live catalogue.
-        pkgs = await _upstream(breaker, lambda: store.list_packages(server, character.openid))
-        package: Package | None = next(
-            (p for p in pkgs if p.package_id == body.package_id), None
-        )
+        character = await _upstream(read_breaker, lambda: provider.resolve(uid, server))
+        if cached is not None:
+            return _to_response(cached, character)
+        pkgs = await _upstream(read_breaker, lambda: store.list_packages(server, character.openid))
+        package: Package | None = next((p for p in pkgs if p.package_id == body.package_id), None)
         if package is None:
             raise ProductNotFoundError(body.package_id)
-
-        # 4. Place the order (region/channel enforced inside the store; response
-        #    validated before success).
-        result = await _upstream(
-            breaker, lambda: store.create_order(character, package, body.quantity, key)
-        )
-    except OrderResultUnknownError:
-        # Keep the key in flight so an immediate resend is blocked; caller must
-        # check order status before retrying.
+        await _upstream(read_breaker, lambda: store.prepare_order(character, package))
+    except Exception:
+        guard.abort(key)  # nothing was dispatched — safe to free the key
         raise
+
+    # Dispatch phase. From here the outcome is uncertain on ANY failure, so keep
+    # the key as 'unknown' (blocks resends until the status is checked).
+    try:
+        _admit(order_breaker)  # circuit open → pre-dispatch, free the key
     except Exception:
         guard.abort(key)
         raise
+    try:
+        result = await _run(
+            order_breaker, lambda: store.dispatch_order(character, package, body.quantity, key)
+        )
+    except Exception:
+        guard.mark_unknown(key, fp)
+        raise
 
-    guard.complete(key, result)
+    guard.complete(key, fp, result)
     return _to_response(result, character)
 
 

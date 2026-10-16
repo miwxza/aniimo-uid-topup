@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+order_state.db
+*.db

@@ -191,21 +191,78 @@ def test_live_invalid_response(live_mode):
     assert r.status_code == 502 and r.json()["error"]["code"] == "UPSTREAM_INVALID_RESPONSE"
 
 
-@respx.mock
-def test_live_duplicate_order_blocked(live_mode):
+def _live_order_routes():
     respx.post(PARTNER).mock(return_value=_partner_role())
     respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
     respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+
+
+@respx.mock
+def test_live_duplicate_order_blocked(live_mode):
+    _live_order_routes()
     respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json=_order_ok()))
     payload = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "k-1"}
     first = live_mode.post("/api/v1/aniimo/order", json=payload)
     assert first.status_code == 200
-    # Same key again → replayed cached result, not a second place_order
+    # Same key + same data → replayed cached result, not a second place_order
     second = live_mode.post("/api/v1/aniimo/order", json=payload)
     assert second.status_code == 200 and second.json()["order_id"] == "ORD123"
-    assert respx.calls.call_count  # place_order hit once for the real order
     po = [c for c in respx.calls if c.request.url.path == "/api/place_order"]
     assert len(po) == 1
+
+
+@respx.mock
+def test_idempotency_key_reuse_with_different_data_conflicts(live_mode):
+    _live_order_routes()
+    respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json=_order_ok()))
+    base = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "k-2"}
+    assert live_mode.post("/api/v1/aniimo/order", json={**base, "quantity": 1}).status_code == 200
+    # Same key, different quantity → must NOT replay the old order.
+    r = live_mode.post("/api/v1/aniimo/order", json={**base, "quantity": 2})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "IDEMPOTENCY_KEY_CONFLICT"
+
+
+@respx.mock
+def test_post_send_invalid_response_blocks_resend(live_mode):
+    _live_order_routes()
+    route = respx.post(f"{STORE}/api/place_order").mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"code": 0, "status": "ok"}})
+    )
+    payload = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "k-3"}
+    first = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert first.status_code == 502 and first.json()["error"]["code"] == "UPSTREAM_INVALID_RESPONSE"
+    # Resend of the same order must NOT hit place_order again (outcome unknown).
+    second = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert second.status_code == 202 and second.json()["error"]["code"] == "ORDER_RESULT_UNKNOWN"
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_post_send_500_blocks_resend(live_mode):
+    _live_order_routes()
+    route = respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(500, json={"code": 0, "data": {}}))
+    payload = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "k-4"}
+    first = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert first.status_code == 502
+    second = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert second.status_code == 202 and second.json()["error"]["code"] == "ORDER_RESULT_UNKNOWN"
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_order_breaker_opens_on_consecutive_order_failures(live_mode):
+    # live_mode sets ANIIMO_BREAKER_THRESHOLD=1 → one order fault opens it.
+    _live_order_routes()
+    route = respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(500, json={"code": 0, "data": {}}))
+    # Distinct keys so the dedupe guard does not mask the breaker behaviour.
+    r1 = live_mode.post("/api/v1/aniimo/order",
+                        json={"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "b-1"})
+    assert r1.status_code == 502
+    # Reads still succeed, but the order-stage circuit is now open → short-circuit.
+    r2 = live_mode.post("/api/v1/aniimo/order",
+                        json={"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "b-2"})
+    assert r2.status_code == 502
+    assert route.call_count == 1  # 2nd order never reached place_order
 
 
 @respx.mock
@@ -217,7 +274,7 @@ def test_live_ip_block(live_mode):
 
 
 @respx.mock
-def test_breaker_opens_after_upstream_fault(live_mode):
+def test_read_breaker_opens_after_upstream_fault(live_mode):
     respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(500, json={"code": 0, "data": {}}))
     r1 = live_mode.get("/api/v1/aniimo/packages", params={"server": "4"})
     assert r1.status_code == 502
@@ -239,7 +296,22 @@ async def test_livestore_refuses_mock_character():
     char = CharacterInfo(uid="412000126173", server="4", role_name="x", openid="MOCK-x", is_mock=True)
     pkg = Package(package_id="290002", product_id="p", coin=300, currency="TWD", price=150, final_price=138)
     with pytest.raises(MockDataInLiveModeError):
-        await store.create_order(char, pkg, 1, "k")
+        await store.prepare_order(char, pkg)
+
+
+# --- unit: durable guard survives a 'restart' (sqlite) ----------------------
+def test_sqlite_guard_persists_unknown_across_restart(tmp_path):
+    from app.aniimo.idempotency import OrderGuard, SqliteStateStore
+    from app.errors import OrderResultUnknownError
+
+    db = str(tmp_path / "state.db")
+    g1 = OrderGuard(SqliteStateStore(db))
+    assert g1.begin("k", "fp") is None
+    g1.mark_unknown("k", "fp")
+    # Simulate a process restart: new guard, same db file.
+    g2 = OrderGuard(SqliteStateStore(db))
+    with pytest.raises(OrderResultUnknownError):
+        g2.begin("k", "fp")  # unknown state is still there, resend blocked
 
 
 def test_prod_plus_mock_fails_fast(monkeypatch):

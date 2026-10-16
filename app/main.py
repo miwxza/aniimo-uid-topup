@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.aniimo.idempotency import OrderGuard, build_state_store
 from app.aniimo.providers import build_provider
-from app.aniimo.store import OrderGuard, build_store
+from app.aniimo.store import build_store
 from app.config import get_settings
 from app.errors import AniimoError
 from app.ratelimit import CircuitBreaker, TokenBucketLimiter
@@ -24,9 +25,14 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.provider = build_provider(settings)
     app.state.store = build_store(settings)
-    app.state.guard = OrderGuard()
+    app.state.guard = OrderGuard(
+        build_state_store(settings.idempotency_backend, settings.idempotency_db_path),
+        done_ttl=settings.idempotency_done_ttl,
+    )
     app.state.limiter = TokenBucketLimiter(settings.rate_limit_per_min, settings.rate_limit_burst)
-    app.state.breaker = CircuitBreaker(settings.breaker_threshold, settings.breaker_cooldown)
+    # Per-stage breakers: reads and order placement fail independently.
+    app.state.read_breaker = CircuitBreaker(settings.breaker_threshold, settings.breaker_cooldown)
+    app.state.order_breaker = CircuitBreaker(settings.breaker_threshold, settings.breaker_cooldown)
     log.info(
         "started: provider=%s mock_mode=%s region=%s",
         settings.role_provider, settings.is_mock_mode, settings.region,

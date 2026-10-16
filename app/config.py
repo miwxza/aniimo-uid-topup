@@ -71,8 +71,18 @@ class Settings(BaseSettings):
     # client cannot spoof the header to dodge the rate limiter.
     trusted_proxies: list[str] = Field(default_factory=list)  # e.g. ["127.0.0.1"]
     # Upstream circuit breaker: open after N consecutive upstream failures.
+    # Applied PER STAGE — a separate breaker guards reads vs order placement, so
+    # repeated order failures open the circuit even when reads keep succeeding.
     breaker_threshold: int = 5
     breaker_cooldown: float = 30.0
+
+    # Durable idempotency/dedupe state for order placement.
+    #   "memory" - in-process (dev/tests; lost on restart)
+    #   "sqlite" - survives restarts (single node); use Redis for a cluster.
+    idempotency_backend: Literal["memory", "sqlite"] = "memory"
+    idempotency_db_path: str = "order_state.db"
+    # Completed entries age out after this; 'unknown'/'in_flight' never expire.
+    idempotency_done_ttl: float = 86400.0
 
     service_name: str = "aniimo-uid-topup"
     env: Literal["dev", "staging", "prod"] = Field(default="dev")

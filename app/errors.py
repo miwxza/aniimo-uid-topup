@@ -131,6 +131,18 @@ class DuplicateOrderError(AniimoError):
         )
 
 
+class IdempotencyKeyConflictError(AniimoError):
+    """The idempotency key was reused with different order data."""
+
+    def __init__(self, idempotency_key: str):
+        super().__init__(
+            code="IDEMPOTENCY_KEY_CONFLICT",
+            message="This idempotency key was already used for a different order.",
+            http_status=409,
+            details={"idempotency_key": idempotency_key},
+        )
+
+
 class MockDataInLiveModeError(AniimoError):
     """A live-mode flow received mock-sourced character data."""
 
