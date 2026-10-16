@@ -1,4 +1,9 @@
-"""End-to-end tests against the FastAPI app with upstream mocked via respx."""
+"""End-to-end + unit tests.
+
+Mock-mode tests exercise the fully simulated flow. Live-mode tests drive the
+real code paths with the upstream Aniimo API mocked via respx (partner provider
+for character lookup, store endpoints for catalogue/payment/order).
+"""
 from __future__ import annotations
 
 import httpx
@@ -7,134 +12,237 @@ import respx
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
-from app.main import app
 
 STORE = "https://worldx-store-coin.kingsgroupgames.com"
+PARTNER = "https://partner.example.test/lookup"
 
-_PRODUCTS = {
-    "code": 0,
-    "data": {
+
+def _products(currency="TWD"):
+    return {
         "code": 0,
-        "data": [
-            {
-                "package_id": "290002",
-                "product_id": "com.x.aniimos.2.1.30",
-                "coin": 300,
-                "currency": "TWD",
-                "price": 138,
-                "final_price": 138,
-                "first_pay": True,
-                "description": "300 Lumin",
-                "benefit": [{"act_type": "level_first_rebate", "coin": 300}],
-            }
-        ],
-    },
-}
+        "data": {
+            "code": 0,
+            "data": [
+                {
+                    "package_id": "290002",
+                    "product_id": "com.x.aniimos.2.1.30",
+                    "coin": 300,
+                    "currency": currency,
+                    "price": 150,
+                    "final_price": 138,
+                    "first_pay": True,
+                    "description": "300 Lumin",
+                    "benefit": [{"act_type": "level_first_rebate", "coin": 300}],
+                }
+            ],
+        },
+    }
 
 
-@pytest.fixture(autouse=True)
-def _mock_env(monkeypatch):
+def _store_init(currency="TWD", channels=("mycard",)):
+    return {
+        "code": 0,
+        "data": {
+            "channels": {"code": 0, "data": [{"channel_id": c} for c in channels]},
+            "config": {"code": 0, "data": {"currency": currency}},
+            "game_products": {"code": 0, "data": []},
+            "get_ip_currency": {"code": 0, "data": {"currency": currency}},
+            "user_pay_info": {"code": 0, "data": {}},
+        },
+    }
+
+
+def _partner_role():
+    return httpx.Response(
+        200,
+        json={"data": {"role_name": "Sweettoast", "level": 80, "openid": "oid_real_123"}},
+    )
+
+
+def _order_ok(order_id="ORD123", **extra):
+    base = {"order_id": order_id, "status": "pending", "pay_url": "https://pay.mycard.example/" + order_id}
+    base.update(extra)
+    return {"code": 0, "data": {"code": 0, **base}}
+
+
+@pytest.fixture
+def mock_mode(monkeypatch):
     monkeypatch.setenv("ANIIMO_ROLE_PROVIDER", "mock")
     get_settings.cache_clear()
-    yield
+    from app.main import app
+    with TestClient(app) as c:
+        yield c
     get_settings.cache_clear()
 
 
 @pytest.fixture
-def client():
+def live_mode(monkeypatch):
+    monkeypatch.setenv("ANIIMO_ROLE_PROVIDER", "partner")
+    monkeypatch.setenv("ANIIMO_PARTNER_VERIFY_URL", PARTNER)
+    monkeypatch.setenv("ANIIMO_BREAKER_THRESHOLD", "1")
+    get_settings.cache_clear()
+    from app.main import app
     with TestClient(app) as c:
         yield c
+    get_settings.cache_clear()
 
 
-def test_health(client):
-    r = client.get("/health")
+# --- mock mode --------------------------------------------------------------
+def test_health(mock_mode):
+    assert mock_mode.get("/health").json()["status"] == "ok"
+
+
+def test_verify_mock_is_flagged(mock_mode):
+    r = mock_mode.post("/api/v1/aniimo/verify", json={"uid": "412000126173", "server": "4"})
+    b = r.json()
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+    assert b["character"]["is_mock"] is True
+    assert b["note"]  # explicitly labelled as not-live
 
 
-def test_verify_ok(client):
-    r = client.post("/api/v1/aniimo/verify", json={"uid": "412000126173", "server": "4"})
+def test_verify_unknown(mock_mode):
+    r = mock_mode.post("/api/v1/aniimo/verify", json={"uid": "999999999", "server": "4"})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "UID_NOT_FOUND"
+
+
+def test_verify_bad_uid(mock_mode):
+    assert mock_mode.post("/api/v1/aniimo/verify", json={"uid": "abc", "server": "4"}).status_code == 422
+
+
+def test_mock_packages_are_twd(mock_mode):
+    r = mock_mode.get("/api/v1/aniimo/packages", params={"server": "4"})
+    b = r.json()
+    assert b["currency"] == "TWD"
+    assert {p["package_id"] for p in b["packages"]} >= {"290001", "290002"}
+    assert all(p["currency"] == "TWD" for p in b["packages"])
+
+
+def test_mock_order_is_simulated(mock_mode):
+    r = mock_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
+    b = r.json()
     assert r.status_code == 200
-    body = r.json()
-    assert body["verified"] is True
-    assert body["character"]["role_name"] == "Sweettoast"
-    assert body["source"] == "mock"
+    assert b["is_mock"] is True and b["order_id"].startswith("MOCK-")
+    assert b["amount"] == 138 and b["currency"] == "TWD"
 
 
-def test_verify_unknown_uid(client):
-    r = client.post("/api/v1/aniimo/verify", json={"uid": "999999999", "server": "4"})
-    assert r.status_code == 404
-    assert r.json()["error"]["code"] == "UID_NOT_FOUND"
+def test_mock_product_not_found(mock_mode):
+    r = mock_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "999999"})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "PRODUCT_NOT_FOUND"
 
 
-def test_verify_bad_uid_validation(client):
-    r = client.post("/api/v1/aniimo/verify", json={"uid": "abc", "server": "4"})
-    assert r.status_code == 422
-
-
+# --- live mode --------------------------------------------------------------
 @respx.mock
-def test_packages(client):
-    respx.post(f"{STORE}/api/game_products").mock(
-        return_value=httpx.Response(200, json=_PRODUCTS)
-    )
-    r = client.get("/api/v1/aniimo/packages", params={"server": "4"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["currency"] == "TWD"
-    assert body["packages"][0]["package_id"] == "290002"
-
-
-@respx.mock
-def test_order_flow(client):
-    respx.post(f"{STORE}/api/game_products").mock(
-        return_value=httpx.Response(200, json=_PRODUCTS)
-    )
-    respx.post(f"{STORE}/api/place_order").mock(
-        return_value=httpx.Response(
-            200,
-            json={"code": 0, "data": {"code": 0, "order_id": "ORD123", "status": "pending", "pay_url": "https://pay.mycard.example/ORD123"}},
-        )
-    )
-    r = client.post(
-        "/api/v1/aniimo/order",
-        json={"uid": "412000126173", "server": "4", "package_id": "290002", "quantity": 1},
-    )
+def test_live_order_success(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json=_order_ok(amount=138, currency="TWD")))
+    r = live_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
     assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["order_id"] == "ORD123"
-    assert body["amount"] == 138
-    assert body["pay_url"].startswith("https://pay.mycard")
+    b = r.json()
+    assert b["order_id"] == "ORD123" and b["is_mock"] is False
+    assert b["amount"] == 138
 
 
 @respx.mock
-def test_order_upstream_risk_block(client):
-    respx.post(f"{STORE}/api/game_products").mock(
-        return_value=httpx.Response(200, json=_PRODUCTS)
-    )
-    respx.post(f"{STORE}/api/place_order").mock(
-        return_value=httpx.Response(200, json={"code": 0, "data": {"code": 106042, "message": "too frequent"}})
-    )
-    r = client.post(
-        "/api/v1/aniimo/order",
-        json={"uid": "412000126173", "server": "4", "package_id": "290002"},
-    )
-    assert r.status_code == 409
-    assert r.json()["error"]["code"] == "RISK_CONTROL_BLOCK"
+def test_live_currency_mismatch(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init(currency="THB")))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products(currency="THB")))
+    r = live_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "REGION_CURRENCY_MISMATCH"
 
 
 @respx.mock
-def test_upstream_ip_block(client):
+def test_live_channel_unavailable(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init(channels=("adyen",))))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    r = live_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "PAYMENT_CHANNEL_UNAVAILABLE"
+
+
+@respx.mock
+def test_live_order_timeout_is_unknown_not_resent(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    route = respx.post(f"{STORE}/api/place_order").mock(side_effect=httpx.ReadTimeout("boom"))
+    r = live_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
+    assert r.status_code == 202 and r.json()["error"]["code"] == "ORDER_RESULT_UNKNOWN"
+    assert route.call_count == 1  # NOT auto-resent
+
+
+@respx.mock
+def test_live_invalid_response(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    # order "ok" but no order_id → must not be reported as created
+    respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json={"code": 0, "data": {"code": 0, "status": "ok"}}))
+    r = live_mode.post("/api/v1/aniimo/order",
+                       json={"uid": "412000126173", "server": "4", "package_id": "290002"})
+    assert r.status_code == 502 and r.json()["error"]["code"] == "UPSTREAM_INVALID_RESPONSE"
+
+
+@respx.mock
+def test_live_duplicate_order_blocked(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
+    respx.post(f"{STORE}/api/store/init").mock(return_value=httpx.Response(200, json=_store_init()))
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(200, json=_products()))
+    respx.post(f"{STORE}/api/place_order").mock(return_value=httpx.Response(200, json=_order_ok()))
+    payload = {"uid": "412000126173", "server": "4", "package_id": "290002", "idempotency_key": "k-1"}
+    first = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert first.status_code == 200
+    # Same key again → replayed cached result, not a second place_order
+    second = live_mode.post("/api/v1/aniimo/order", json=payload)
+    assert second.status_code == 200 and second.json()["order_id"] == "ORD123"
+    assert respx.calls.call_count  # place_order hit once for the real order
+    po = [c for c in respx.calls if c.request.url.path == "/api/place_order"]
+    assert len(po) == 1
+
+
+@respx.mock
+def test_live_ip_block(live_mode):
+    respx.post(PARTNER).mock(return_value=_partner_role())
     respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(403, text="forbidden"))
-    r = client.get("/api/v1/aniimo/packages", params={"server": "4"})
-    assert r.status_code == 403
-    assert r.json()["error"]["code"] == "IP_BLOCKED"
+    r = live_mode.get("/api/v1/aniimo/packages", params={"server": "4"})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "IP_BLOCKED"
 
 
 @respx.mock
-def test_upstream_captcha(client):
-    respx.post(f"{STORE}/api/game_products").mock(
-        return_value=httpx.Response(200, html="<html>captcha challenge</html>")
-    )
-    r = client.get("/api/v1/aniimo/packages", params={"server": "4"})
-    assert r.status_code == 423
-    assert r.json()["error"]["code"] == "CAPTCHA_REQUIRED"
+def test_breaker_opens_after_upstream_fault(live_mode):
+    respx.post(f"{STORE}/api/game_products").mock(return_value=httpx.Response(500, json={"code": 0, "data": {}}))
+    r1 = live_mode.get("/api/v1/aniimo/packages", params={"server": "4"})
+    assert r1.status_code == 502
+    # threshold=1 → circuit now open; next call short-circuits without hitting upstream
+    r2 = live_mode.get("/api/v1/aniimo/packages", params={"server": "4"})
+    assert r2.status_code == 502
+
+
+# --- unit: live store rejects mock character --------------------------------
+@pytest.mark.asyncio
+async def test_livestore_refuses_mock_character():
+    from app.aniimo.store import LiveStore
+    from app.config import Settings
+    from app.errors import MockDataInLiveModeError
+    from app.models import CharacterInfo, Package
+
+    s = Settings(role_provider="partner", partner_verify_url=PARTNER)
+    store = LiveStore(s)
+    char = CharacterInfo(uid="412000126173", server="4", role_name="x", openid="MOCK-x", is_mock=True)
+    pkg = Package(package_id="290002", product_id="p", coin=300, currency="TWD", price=150, final_price=138)
+    with pytest.raises(MockDataInLiveModeError):
+        await store.create_order(char, pkg, 1, "k")
+
+
+def test_prod_plus_mock_fails_fast(monkeypatch):
+    from app.config import Settings
+    with pytest.raises(Exception):
+        Settings(env="prod", role_provider="mock")

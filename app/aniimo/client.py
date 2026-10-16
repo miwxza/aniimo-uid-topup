@@ -23,6 +23,7 @@ from app.config import Settings
 from app.errors import (
     CaptchaRequiredError,
     IpBlockedError,
+    OrderResultUnknownError,
     RateLimitedError,
     RiskControlError,
     UpstreamBusinessError,
@@ -80,18 +81,47 @@ class AniimoClient:
         return body
 
     # -- transport ----------------------------------------------------------
-    async def _post(self, base: str, path: str, payload: dict) -> dict[str, Any]:
+    async def _post(
+        self,
+        base: str,
+        path: str,
+        payload: dict,
+        *,
+        idempotent: bool = True,
+        headers: dict | None = None,
+    ) -> dict[str, Any]:
+        """POST with a retry policy that depends on idempotency.
+
+        For idempotent reads we retry connect/read failures. For a
+        NON-idempotent call (``place_order``) we must never auto-resend once the
+        request may have reached the server: a ``ReadTimeout`` means the outcome
+        is unknown, so we raise ``OrderResultUnknownError`` instead of retrying,
+        and only a pre-send ``ConnectError`` (provably never delivered) may be
+        retried up to ``order_connect_retries``.
+        """
         assert self._client is not None
         url = base.rstrip("/") + path
+        max_attempts = (self.s.http_retries if idempotent else self.s.order_connect_retries) + 1
         last_exc: Exception | None = None
-        for attempt in range(self.s.http_retries + 1):
+        for attempt in range(max_attempts):
             try:
-                resp = await self._client.post(url, json=payload)
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                resp = await self._client.post(url, json=payload, headers=headers)
+            except httpx.ReadTimeout as e:
+                if not idempotent:
+                    # Request may have been processed; do NOT resend.
+                    raise OrderResultUnknownError() from e
                 last_exc = e
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # Never reached the server → safe to retry within limits.
+                last_exc = e
+            except httpx.RemoteProtocolError as e:
+                if not idempotent:
+                    raise OrderResultUnknownError() from e
+                last_exc = e
+            else:
+                return self._unwrap(resp)
+            if attempt < max_attempts - 1:
                 await asyncio.sleep(self.s.http_retry_backoff * (2**attempt))
-                continue
-            return self._unwrap(resp)
         raise UpstreamUnavailableError(str(last_exc) if last_exc else "no response")
 
     def _unwrap(self, resp: httpx.Response) -> dict[str, Any]:
@@ -140,9 +170,17 @@ class AniimoClient:
             self.s.store_api_base, "/api/game_products", self._envelope(server_id, extra)
         )
 
-    async def place_order(self, server_id: str | int, order: dict) -> dict:
+    async def place_order(
+        self, server_id: str | int, order: dict, *, idempotency_key: str | None = None
+    ) -> dict:
+        # Non-idempotent: a read timeout must not trigger an automatic resend.
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         return await self._post(
-            self.s.store_api_base, "/api/place_order", self._envelope(server_id, order)
+            self.s.store_api_base,
+            "/api/place_order",
+            self._envelope(server_id, order),
+            idempotent=False,
+            headers=headers,
         )
 
     async def preload_order(self, server_id: str | int, order: dict) -> dict:

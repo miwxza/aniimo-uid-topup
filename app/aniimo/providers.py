@@ -23,15 +23,18 @@ from app.config import Settings
 from app.errors import InvalidUidError, UpstreamUnavailableError
 from app.models import CharacterInfo
 
-# Demo fixtures mirror the assignment's example screenshot.
+# Demo fixtures mirror the assignment's example screenshot. These are clearly
+# flagged mock records (is_mock=True) and the openid is a *fixture*, not derived
+# from the UID — LiveStore refuses to order from them.
 _MOCK_ROLES: dict[tuple[str, str], CharacterInfo] = {
     ("412000126173", "4"): CharacterInfo(
         uid="412000126173",
         server="4",
         role_name="Sweettoast",
         level=80,
-        openid="oid_412000126173",
+        openid="MOCK-openid-sweettoast",
         avatar_url=None,
+        is_mock=True,
     ),
 }
 

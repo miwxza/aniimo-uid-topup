@@ -10,7 +10,14 @@ to a stable JSON contract:
 | Code | HTTP | Meaning |
 |---|---|---|
 | `UID_NOT_FOUND` | 404 | No character for UID/server |
-| `SERVER_INVALID` | 422 | Unknown/unsupported server, or package not in catalogue |
+| `SERVER_INVALID` | 422 | Unknown/unsupported server (format or value) |
+| `PRODUCT_NOT_FOUND` | 404 | package_id not in the live catalogue (distinct from bad server) |
+| `REGION_CURRENCY_MISMATCH` | 409 | Catalogue not priced in TWD (needs a Taiwan egress) |
+| `PAYMENT_CHANNEL_UNAVAILABLE` | 409 | Upstream does not offer MyCard for this context |
+| `DUPLICATE_ORDER` | 409 | Identical order already in flight (idempotency guard) |
+| `ORDER_RESULT_UNKNOWN` | 202 | place_order outcome unconfirmed (e.g. read timeout) — check status, do not resend |
+| `UPSTREAM_INVALID_RESPONSE` | 502 | Order "ok" but missing order_id / amount / currency per contract |
+| `MOCK_DATA_IN_LIVE_MODE` | 409 | Live order attempted from mock character data |
 | `RATE_LIMITED` | 429 | Our own per-client token bucket tripped |
 | `RATE_LIMITED_UPSTREAM` | 429 | Upstream returned 429 |
 | `CAPTCHA_REQUIRED` | 423 | Upstream served a CAPTCHA/interstitial instead of JSON |
@@ -18,6 +25,30 @@ to a stable JSON contract:
 | `RISK_CONTROL_BLOCK` | 409 | Upstream risk code (e.g. 106042 order-too-frequent) |
 | `UPSTREAM_UNAVAILABLE` | 502 | Network error / 5xx / circuit open |
 | `UPSTREAM_BUSINESS_ERROR` | 502 | Any other non-zero business code |
+
+## Duplicate orders (idempotency)
+
+- Reads retry on connect/read failures; **order placement does not** — retry
+  policy is split per operation.
+- `place_order` is sent with an `Idempotency-Key` (client-supplied or derived
+  from `uid|server|package_id|quantity`). An in-memory `OrderGuard` rejects an
+  identical in-flight request (`DUPLICATE_ORDER`) and replays a just-completed
+  one instead of ordering twice. Back it with Redis for multi-node.
+- On a `place_order` **read timeout** the outcome is unknown, so the service
+  returns `ORDER_RESULT_UNKNOWN` (202), keeps the key in flight (blocking blind
+  resends), and the caller must query order status before retrying.
+
+## Region / currency / channel enforcement
+
+Before an order is placed, `LiveStore` checks **from upstream** that the package
+currency is `TWD` and that MyCard is in the available channels (from
+`store/init`). A `"mycard"` value in config alone is not treated as proof.
+
+## Order response validation
+
+A `place_order` success is only reported when the response carries a valid
+`order_id` and (when present) a matching `amount`/`currency`; otherwise
+`UPSTREAM_INVALID_RESPONSE` instead of a false `created`.
 
 ## Rate limiting
 

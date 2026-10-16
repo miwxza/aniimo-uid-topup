@@ -119,3 +119,30 @@ and the MyCard channel the upstream calls must egress from a **Taiwan IP**
 - `POST /api/game_products` (unauthenticated) → 200, 9 packages parsed
   (60/300/980/1980/3280/6480 Lumin + 3 passes), confirming the catalogue is
   readable without login.
+
+### Evidence (redacted)
+
+Request (from a Thailand IP; currency therefore `THB`, not `TWD`):
+
+```http
+POST /api/game_products HTTP/1.1
+Host: worldx-store-coin.kingsgroupgames.com
+Content-Type: application/json
+
+{"game_id":999002,"game_project":"worldx_global","source":"web","server_id":1}
+```
+
+Response (trimmed to one item):
+
+```json
+{"code":0,"data":{"code":0,"message":"ok","data":[
+  {"package_id":"290002","product_id":"com.x.aniimos.2.1.30","coin":300,
+   "currency":"THB","price":199,"final_price":184,"first_pay":true,
+   "benefit":[{"act_type":"level_first_rebate","coin":300,"discount":1}]}
+]}}
+```
+
+This confirms: unauthenticated read, the `{code:0,data:{code:0,data:[…]}}`
+double envelope, IP-derived currency, and the package shape the service maps.
+Only the unauthenticated catalogue was exercised live; `place_order` was **not**
+fired against production (it is covered by tests with a mocked upstream).

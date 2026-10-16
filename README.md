@@ -21,23 +21,54 @@ assessment.
 ```
 client ──► FastAPI ──► RoleProvider ─┐  (uid+server → character + openid)
                         │            │     partner API | account session | mock
-                        └─► StoreService ─► Aniimo store API
+                        └─► Store ────────► Aniimo store API  (LiveStore)
+                                     └────► simulated          (MockStore)
                                             game_products / place_order (openid-bound)
 ```
 
+**Mock mode vs live mode** are system-wide and driven by the provider, so they
+never diverge:
+
+- `ANIIMO_ROLE_PROVIDER=mock` → **mock mode**: character lookup, catalogue and
+  ordering are all simulated (`MockStore`). Nothing hits the real API. Mock
+  characters are flagged `is_mock: true` and carry a `note`.
+- `partner` / `session` → **live mode** (`LiveStore`): real upstream, and it
+  **refuses mock character data**. `ANIIMO_ENV=prod` with `mock` fails at
+  startup.
+
 - **RoleProvider** (`app/aniimo/providers.py`) — resolves `(uid, server)` →
-  character. Because the shop has no public UID lookup, this is a strategy:
-  - `partner` — a publisher partner UID-lookup endpoint (production).
-  - `session` — bridge through one authenticated store-account session
-    (resolves only that account's own roles).
-  - `mock` — deterministic fixtures for local dev / CI / demo (default).
-- **StoreService** (`app/aniimo/store.py`) — reads the live catalogue and
-  places the openid-bound order. This path is **real** and talks to the live
-  upstream.
-- **Resilience** (`app/ratelimit.py`, `app/errors.py`) — token-bucket rate
-  limiting, upstream circuit breaker, and a stable error contract covering rate
-  limits, IP blocking, CAPTCHA and invalid UID. See
-  [`docs/EDGE_CASES.md`](docs/EDGE_CASES.md).
+  character. The shop has no public UID lookup, so this is a strategy:
+  - `partner` — a publisher partner UID-lookup endpoint (production). **Not yet
+    connected** — needs a real endpoint + key.
+  - `session` — bridge through one authenticated store-account session;
+    **resolves only that account's own roles**, not arbitrary customer UIDs.
+  - `mock` — deterministic, clearly-flagged fixtures for dev / CI / demo. The
+    fixture openid is a constant, **never derived from the UID**.
+- **Store** (`app/aniimo/store.py`) — `LiveStore` reads the real catalogue and
+  places the openid-bound order; before ordering it **enforces TWD + MyCard from
+  upstream** (`REGION_CURRENCY_MISMATCH` / `PAYMENT_CHANNEL_UNAVAILABLE`),
+  dedupes with an idempotency guard, and **validates the order response** before
+  reporting success (`UPSTREAM_INVALID_RESPONSE`).
+- **Resilience** (`app/ratelimit.py`, `app/errors.py`) — per-client token
+  bucket (X-Forwarded-For trusted only from configured proxies), a circuit
+  breaker that counts only upstream faults, split read-vs-order retry (an order
+  read-timeout is reported `ORDER_RESULT_UNKNOWN`, never auto-resent), and a
+  stable error contract. See [`docs/EDGE_CASES.md`](docs/EDGE_CASES.md).
+
+### What is actually tested vs pending
+
+| Area | Status |
+|---|---|
+| RE of store/account API, envelope, openid ordering, no-signature | Verified by reading the live bundles + live unauthenticated `store/init`/`game_products` calls |
+| `verify` / `packages` / `order` in **mock mode** | Fully tested (`pytest`) |
+| **live-mode** order flow, TWD/MyCard enforcement, timeout→unknown, duplicate guard, invalid-response, breaker | Tested with the upstream **mocked** (`respx`) |
+| `partner` provider against a **real** endpoint | **Pending** — no partner endpoint available |
+| Real **TWD + MyCard** pricing from upstream | **Pending** — needs a Taiwan egress (`ANIIMO_OUTBOUND_PROXY`) |
+
+> "Verified live" in this repo means the **unauthenticated catalogue** calls
+> (`store/init`, `game_products`) were run against the real host and returned the
+> documented shape. The order placement path is proven against a mocked upstream,
+> not fired against production.
 
 ## API
 
@@ -51,8 +82,9 @@ Base: `/api/v1/aniimo`. Interactive docs at `/docs` once running.
 ```json
 {
   "verified": true,
-  "character": { "uid": "412000126173", "server": "4", "role_name": "Sweettoast", "level": 80, "openid": "oid_412000126173" },
-  "source": "mock"
+  "character": { "uid": "412000126173", "server": "4", "role_name": "Sweettoast", "level": 80, "openid": "MOCK-openid-sweettoast", "is_mock": true },
+  "source": "mock",
+  "note": "Illustrative mock result — not a live game lookup. ..."
 }
 ```
 
@@ -107,9 +139,12 @@ ANIIMO_OUTBOUND_PROXY=http://user:pass@tw-proxy.example.com:8080
 pytest -q
 ```
 
-9 tests cover verify (ok / unknown / bad-format), the live-shaped packages and
-order flow, and the risk/IP-block/CAPTCHA edge cases (upstream mocked with
-`respx`).
+Tests cover: mock-mode verify/packages/order (incl. `is_mock` flagging and
+product-not-found), and live-mode (upstream mocked with `respx`) order success,
+`REGION_CURRENCY_MISMATCH`, `PAYMENT_CHANNEL_UNAVAILABLE`, order read-timeout →
+`ORDER_RESULT_UNKNOWN` (asserting it is **not** re-sent), duplicate-order replay,
+`UPSTREAM_INVALID_RESPONSE`, `IP_BLOCKED`, circuit-breaker opening, `LiveStore`
+refusing mock character data, and `prod`+`mock` failing at startup.
 
 ## Test account (from the brief)
 
@@ -141,8 +176,15 @@ requests.http        REST Client / JetBrains HTTP samples
 
 ## Scope & honesty
 
-The order path and catalogue are implemented against the **real** upstream and
-verified live. Arbitrary-UID verification depends on a data source the public
-shop does not expose; the `mock` provider ships so the whole flow runs
-end-to-end, and `partner` / `session` are the real integration points. This is
-a security-research / tooling exercise against the operator's own shop.
+- **Reverse engineering** of the store/account API (envelope, openid-bound
+  ordering, no signature) is real and documented, confirmed against the live
+  **unauthenticated** endpoints.
+- **Arbitrary-UID verification** is the one thing the public shop does not
+  expose. It is a pluggable provider; `partner`/`session` are the real
+  integration points and are **not yet connected to a live source**. `mock`
+  ships so the whole flow runs end-to-end and is clearly flagged as simulated.
+- **Order placement** is implemented and tested against a **mocked** upstream;
+  it is not fired against production, and real TWD/MyCard pricing needs a Taiwan
+  egress. See the "actually tested vs pending" table above.
+
+A security-research / tooling exercise against the operator's own shop.

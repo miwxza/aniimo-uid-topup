@@ -58,6 +58,90 @@ class InvalidServerError(AniimoError):
         )
 
 
+class ProductNotFoundError(AniimoError):
+    """The requested package_id is not in the live catalogue (vs a bad server)."""
+
+    def __init__(self, package_id: str):
+        super().__init__(
+            code="PRODUCT_NOT_FOUND",
+            message="No package with that id in the current catalogue.",
+            http_status=404,
+            details={"package_id": package_id},
+        )
+
+
+class RegionCurrencyMismatchError(AniimoError):
+    def __init__(self, expected: str, got: str):
+        super().__init__(
+            code="REGION_CURRENCY_MISMATCH",
+            message=f"Upstream catalogue is priced in {got}, not {expected}. "
+            "Route egress through a Taiwan IP.",
+            http_status=409,
+            details={"expected": expected, "got": got},
+        )
+
+
+class PaymentChannelUnavailableError(AniimoError):
+    def __init__(self, channel: str):
+        super().__init__(
+            code="PAYMENT_CHANNEL_UNAVAILABLE",
+            message=f"Upstream does not offer the '{channel}' payment channel for this context.",
+            http_status=409,
+            details={"channel": channel},
+        )
+
+
+class UpstreamInvalidResponseError(AniimoError):
+    """place_order returned 'ok' but without a usable order per the contract."""
+
+    def __init__(self, reason: str, raw: dict | None = None):
+        super().__init__(
+            code="UPSTREAM_INVALID_RESPONSE",
+            message=f"Upstream order response did not satisfy the contract: {reason}",
+            http_status=502,
+            details={"reason": reason, **({"raw_keys": sorted(raw)} if raw else {})},
+        )
+
+
+class OrderResultUnknownError(AniimoError):
+    """We sent place_order but never learned the outcome (e.g. read timeout).
+
+    The caller must NOT blindly retry; it should query order status first.
+    """
+
+    def __init__(self, idempotency_key: str | None = None):
+        super().__init__(
+            code="ORDER_RESULT_UNKNOWN",
+            message="Order was submitted but its result is unconfirmed. "
+            "Check order status before retrying — do not resend.",
+            http_status=202,
+            details={"idempotency_key": idempotency_key} if idempotency_key else None,
+        )
+
+
+class DuplicateOrderError(AniimoError):
+    """The same order request is already in flight / was just placed."""
+
+    def __init__(self, idempotency_key: str):
+        super().__init__(
+            code="DUPLICATE_ORDER",
+            message="An identical order is already in progress or was just created.",
+            http_status=409,
+            details={"idempotency_key": idempotency_key},
+        )
+
+
+class MockDataInLiveModeError(AniimoError):
+    """A live-mode flow received mock-sourced character data."""
+
+    def __init__(self):
+        super().__init__(
+            code="MOCK_DATA_IN_LIVE_MODE",
+            message="Refusing to place a live order from mock character data.",
+            http_status=409,
+        )
+
+
 # --- Anti-abuse / upstream protections -------------------------------------
 class RateLimitedError(AniimoError):
     def __init__(self, retry_after: int = 60, *, upstream: bool = False):

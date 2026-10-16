@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,15 +60,38 @@ class Settings(BaseSettings):
     http_timeout: float = 15.0
     http_retries: int = 2
     http_retry_backoff: float = 0.5
+    # Retry policy is split: reads may retry, order placement may NOT auto-retry
+    # on an ambiguous failure (see AniimoClient). order_connect_retries only
+    # covers failures that provably never reached the server.
+    order_connect_retries: int = 0
     # Per-client rate limit on our own endpoints (token bucket).
     rate_limit_per_min: int = 30
     rate_limit_burst: int = 10
+    # Trust X-Forwarded-For only when the direct peer is a known proxy, so a
+    # client cannot spoof the header to dodge the rate limiter.
+    trusted_proxies: list[str] = Field(default_factory=list)  # e.g. ["127.0.0.1"]
     # Upstream circuit breaker: open after N consecutive upstream failures.
     breaker_threshold: int = 5
     breaker_cooldown: float = 30.0
 
     service_name: str = "aniimo-uid-topup"
     env: Literal["dev", "staging", "prod"] = Field(default="dev")
+
+    @property
+    def is_mock_mode(self) -> bool:
+        """System-wide mock mode: character lookup, catalogue and ordering are
+        all simulated. Driven by the role provider so the two never diverge."""
+        return self.role_provider == "mock"
+
+    @model_validator(mode="after")
+    def _guard_prod(self) -> "Settings":
+        # Never let a production deployment silently run on mock data.
+        if self.env == "prod" and self.role_provider == "mock":
+            raise ValueError(
+                "ANIIMO_ROLE_PROVIDER=mock is not allowed with ANIIMO_ENV=prod; "
+                "configure a real provider (partner|session)."
+            )
+        return self
 
 
 @lru_cache
