@@ -1,0 +1,59 @@
+{
+  "info": {
+    "name": "Aniimo UID Top-Up API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "UID-based top-up service for the Aniimo webshop (Taiwan / TWD / MyCard)."
+  },
+  "variable": [
+    { "key": "base", "value": "http://localhost:8000" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": { "method": "GET", "url": "{{base}}/health" }
+    },
+    {
+      "name": "Verify UID",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{base}}/api/v1/aniimo/verify",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"uid\": \"412000126173\",\n  \"server\": \"4\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Verify UID - unknown (404)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{base}}/api/v1/aniimo/verify",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"uid\": \"999999999\",\n  \"server\": \"4\"\n}"
+        }
+      }
+    },
+    {
+      "name": "List packages",
+      "request": {
+        "method": "GET",
+        "url": "{{base}}/api/v1/aniimo/packages?server=4"
+      }
+    },
+    {
+      "name": "Create order (MyCard)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{base}}/api/v1/aniimo/order",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"uid\": \"412000126173\",\n  \"server\": \"4\",\n  \"package_id\": \"290002\",\n  \"quantity\": 1\n}"
+        }
+      }
+    }
+  ]
+}

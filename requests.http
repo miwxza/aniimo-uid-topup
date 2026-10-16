@@ -1,0 +1,47 @@
+### Aniimo UID Top-Up API — local test requests
+### Use with VS Code REST Client or JetBrains HTTP Client.
+@base = http://localhost:8000
+
+### Health
+GET {{base}}/health
+
+### Verify a UID (mock provider → Sweettoast, Lv80, Server 4)
+POST {{base}}/api/v1/aniimo/verify
+Content-Type: application/json
+
+{
+  "uid": "412000126173",
+  "server": "4"
+}
+
+### Verify — unknown UID (404 UID_NOT_FOUND)
+POST {{base}}/api/v1/aniimo/verify
+Content-Type: application/json
+
+{
+  "uid": "999999999",
+  "server": "4"
+}
+
+### Verify — invalid UID format (422)
+POST {{base}}/api/v1/aniimo/verify
+Content-Type: application/json
+
+{
+  "uid": "abc",
+  "server": "4"
+}
+
+### List packages (live upstream catalogue)
+GET {{base}}/api/v1/aniimo/packages?server=4
+
+### Create a UID-based order (MyCard)
+POST {{base}}/api/v1/aniimo/order
+Content-Type: application/json
+
+{
+  "uid": "412000126173",
+  "server": "4",
+  "package_id": "290002",
+  "quantity": 1
+}
