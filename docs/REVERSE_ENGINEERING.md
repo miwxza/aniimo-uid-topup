@@ -84,13 +84,13 @@ at all.
 
 Character name / server / openid are only returned by
 `GET /api/player/roles`, which lists the roles of the **currently logged-in
-account** (session cookie set by `/api/player/login`). Role shape:
+account** (Bearer token in the current office SDK). Role shape:
 
 ```
-{ targetClusterId, roleId (=UID), roleName, serverArea, openId, isDefault, avatar }
+{ targetClusterId, roleId (=UID), roleName, serverArea, openid, isDefault, avatarUrl }
 ```
 
-There is **no public "lookup any UID → character" endpoint**. The `ame` host
+No arbitrary-UID lookup was found in the inspected public bundles. This is a limited observation, not proof that no such API exists. The `ame` host
 and the `uaid*` calls in `sm.min.js` are device/phone-auth, not role lookup.
 
 ### Consequence for "Via Login → UID Top-Up"
@@ -98,11 +98,11 @@ and the `uaid*` calls in `sm.min.js` are device/phone-auth, not role lookup.
 To verify an **arbitrary** customer UID (as in the Midasbuy-style reference
 flow) you need a source the public shop does not expose:
 
-- a **publisher partner UID-lookup API** (the production answer), or
+- an authorized **publisher UID-lookup API**, if one is available, or
 - an authenticated **store-account session** that can only see its own roles.
 
 The service makes this a pluggable `RoleProvider` (`app/aniimo/providers.py`)
-so the real, working order flow (openid → `place_order`) is decoupled from how
+so the implemented order flow (tested with a mocked upstream) is decoupled from how
 the openid/name is obtained.
 
 ## 5. Currency & MyCard
@@ -146,3 +146,48 @@ This confirms: unauthenticated read, the `{code:0,data:{code:0,data:[…]}}`
 double envelope, IP-derived currency, and the package shape the service maps.
 Only the unauthenticated catalogue was exercised live; `place_order` was **not**
 fired against production (it is covered by tests with a mocked upstream).
+
+
+## Current office-account evidence (2026-10-16)
+
+The browser capture and the current public login SDK identify:
+
+- `GET https://worldx-office-api.aniimo.com/api/player/roles`
+- `Authorization: Bearer <operator credential>`; SDK uses `credentials: omit`.
+- Response: `{"code":200,"msg":null,"data":{"roles":[...]}}`.
+- Role keys include `roleId`, `roleName`, `nickname`, `serverArea`, `openid`,
+  `avatarUrl`, and `level` (observed as a numeric string).
+- `POST /api/player/roles/refresh` refreshes the authenticated account's roles;
+  `PUT /api/player/roles/default` selects one of those roles.
+
+The store coin host remains separate and keeps its code=0 envelope. Earlier
+sections describe the older bundle/account-host assumptions; for roles the
+office host and Bearer contract above supersede cookie-only assumptions.
+The source SDK was read at:
+https://worldx-website-cdn.aniimo.com/official-website/worldx/office_global/login_sdk/worldx-login-dialog-1.1.5.js
+
+The inspected SDK and store endpoint maps did not expose an arbitrary UID
+lookup. No credentials from screenshots were used. No production order was
+created. Session-only verification is NOT completion of the UID-only brief.
+Next evidence needed: an authorized UID lookup contract and real TW/TWD/MyCard
+catalogue/channel data. Unknown routes were not guessed or enumerated.
+
+Read-only check on 2026-10-16: GET office `/api/player/roles` without
+Authorization returned HTTP 401 and `{"code":401,"msg":null,"data":null}`.
+This confirms authentication is required for this endpoint, not that all
+possible UID lookup integrations are unavailable.
+
+
+## Additional read-only findings (2026-10-16)
+
+- A store request with JSON `server_id: "4"` returned business code 106000
+  (invalid param); JSON `server_id: 4` succeeded. The client now emits an integer.
+- Current unauthenticated store/init from this machine reports country TH,
+  currency THB, and no payment channels. This does not prove MyCard is absent
+  for authenticated Taiwan checkouts; that environment is still untested.
+- The store bundle consumes inner business `data` for order_id/pay_url; the
+  order client now supports that nested payload (regression-tested with mocks).
+- The bundle appends uid alongside session_key/fp_session_key to login URLs.
+  That is account credential forwarding/role selection, not UID-only auth.
+- No production order was sent, no screenshot token was used, and arbitrary
+  UID lookup remains unverified.

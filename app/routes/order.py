@@ -81,6 +81,8 @@ async def _upstream(breaker: CircuitBreaker, make: Callable[[], Awaitable[T]]) -
 async def packages(
     request: Request,
     server: str = "1",
+    uid: str | None = None,
+    provider: RoleProvider = Depends(get_provider),
     store: Store = Depends(get_store),
     settings: Settings = Depends(get_settings),
     limiter: TokenBucketLimiter = Depends(get_limiter),
@@ -88,10 +90,27 @@ async def packages(
 ) -> PackagesResponse:
     limiter.check(f"packages:{client_key(request)}")
     server = normalize_server(server)
-    pkgs = await _upstream(read_breaker, lambda: store.list_packages(server))
-    currency = pkgs[0].currency if pkgs else settings.expected_currency
+    openid = None
+    ctx = None
+    if uid is not None:
+        uid = normalize_uid(uid)
+        character = await _upstream(read_breaker, lambda: provider.resolve(uid, server))
+        openid = character.openid
+        # Resolve from the configured provider; never trust a browser-supplied openid.
+        if not openid:
+            from app.errors import UpstreamInvalidResponseError
+            raise UpstreamInvalidResponseError("verified character has no store identity")
+        ctx = await _upstream(read_breaker, lambda: store.payment_context(server, openid))
+    pkgs = await _upstream(read_breaker, lambda: store.list_packages(server, openid))
+    currency = pkgs[0].currency if pkgs else (ctx.currency if ctx else settings.expected_currency)
+    available = settings.payment_channel_id.lower() in [c.lower() for c in ctx.channels] if ctx else None
+    ready = None
+    if ctx:
+        ready = bool(pkgs) and available and ctx.country.upper() == settings.region and ctx.currency.upper() == settings.expected_currency.upper() and all(p.currency.upper() == settings.expected_currency.upper() for p in pkgs)
     return PackagesResponse(
-        currency=currency, payment_channel=settings.payment_channel_id, packages=pkgs
+        currency=currency, payment_channel=settings.payment_channel_id, packages=pkgs,
+        country=ctx.country or None if ctx else None,
+        mycard_available=available, checkout_ready=ready,
     )
 
 

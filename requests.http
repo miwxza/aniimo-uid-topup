@@ -45,3 +45,23 @@ Content-Type: application/json
   "package_id": "290002",
   "quantity": 1
 }
+
+
+### Live session: use tools.run_session and base http://127.0.0.1:8002
+### Only returns this connected account's role. No token belongs in this file.
+POST http://127.0.0.1:8002/api/v1/aniimo/verify
+Content-Type: application/json
+
+{"uid":"412001104638","server":"4"}
+
+### Invalid server format (422)
+POST {{base}}/api/v1/aniimo/verify
+Content-Type: application/json
+
+{"uid":"412000126173","server":"abc"}
+
+### Session: UID not in connected account (404 UID_NOT_IN_ACCOUNT)
+POST http://127.0.0.1:8002/api/v1/aniimo/verify
+Content-Type: application/json
+
+{"uid":"999999999","server":"4"}

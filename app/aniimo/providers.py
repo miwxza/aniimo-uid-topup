@@ -1,8 +1,7 @@
 """RoleProvider abstraction: resolve a (uid, server) -> CharacterInfo.
 
-The official Aniimo webshop exposes **no public UID-lookup endpoint**. Character
-data is only available via ``/api/player/roles`` scoped to the logged-in
-account. Converting "Via Login" to "UID Top-Up" therefore requires an
+No arbitrary-UID lookup was found in the inspected public bundles. The
+observed ``/api/player/roles`` is scoped to the logged-in account. Converting "Via Login" to "UID Top-Up" therefore requires an
 out-of-band source for arbitrary-UID verification. We make that source a
 pluggable strategy so the order flow (which is real) stays decoupled from it.
 
@@ -20,7 +19,7 @@ import httpx
 
 from app.aniimo.client import AniimoClient
 from app.config import Settings
-from app.errors import InvalidUidError, UpstreamUnavailableError
+from app.errors import InvalidUidError, UidNotInAccountError, UpstreamUnavailableError
 from app.models import CharacterInfo
 
 # Demo fixtures mirror the assignment's example screenshot. These are clearly
@@ -86,7 +85,22 @@ class PartnerRoleProvider(RoleProvider):
             raise InvalidUidError(uid, server)
         if r.status_code >= 400:
             raise UpstreamUnavailableError(f"partner lookup status {r.status_code}")
-        d = r.json().get("data", r.json())
+        try:
+            body = r.json()
+        except ValueError:
+            raise UpstreamUnavailableError("Partner returned invalid JSON.") from None
+        if not isinstance(body, dict):
+            raise UpstreamUnavailableError("Partner returned an invalid envelope.")
+        # This is a configurable integration contract, not a discovered public API.
+        if body.get("code") not in (None, 0, 200):
+            raise UpstreamUnavailableError("Partner rejected the lookup.")
+        d = body.get("data", body)
+        if not isinstance(d, dict):
+            raise UpstreamUnavailableError("Partner returned invalid role data.")
+        returned_uid = d.get("uid", d.get("roleId"))
+        returned_server = d.get("server", d.get("serverArea"))
+        if (returned_uid is not None and str(returned_uid) != uid) or (returned_server is not None and str(returned_server) != server):
+            raise UpstreamUnavailableError("Partner returned a different UID/server.")
         name = d.get("role_name") or d.get("roleName")
         if not name:
             raise InvalidUidError(uid, server)
@@ -111,24 +125,26 @@ class SessionRoleProvider(RoleProvider):
 
     def __init__(self, settings: Settings):
         self.s = settings
-        if not settings.account_session_cookie:
-            raise RuntimeError("ANIIMO_ACCOUNT_SESSION_COOKIE is required for role_provider=session")
+        if not settings.account_bearer_token and not settings.account_session_cookie:
+            raise RuntimeError("ANIIMO_ACCOUNT_BEARER_TOKEN is required for role_provider=session")
 
     async def resolve(self, uid: str, server: str) -> CharacterInfo:
         async with AniimoClient(self.s) as client:
             data = await client.player_roles(self.s.account_session_cookie)
         roles = data.get("roles") or []
         for role in roles:
+            if not isinstance(role, dict):
+                raise UpstreamUnavailableError("Invalid account role record.")
             if str(role.get("roleId")) == uid and str(role.get("serverArea")) == server:
                 return CharacterInfo(
                     uid=uid,
                     server=server,
-                    role_name=role.get("roleName") or role.get("roleId"),
+                    role_name=role.get("roleName") or role.get("nickname") or "",
                     level=role.get("level"),
                     openid=role.get("openId") or role.get("openid"),
-                    avatar_url=role.get("avatar") or role.get("avatarUrl"),
+                    avatar_url=role.get("avatarUrl") or role.get("avatar"),
                 )
-        raise InvalidUidError(uid, server)
+        raise UidNotInAccountError(uid, server)
 
 
 def build_provider(settings: Settings) -> RoleProvider:

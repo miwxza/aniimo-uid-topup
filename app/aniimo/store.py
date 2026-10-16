@@ -59,13 +59,20 @@ def map_packages(products: list[dict]) -> list[Package]:
 class PaymentContext:
     currency: str
     channels: list[str]
+    country: str = ""
 
 
 def assert_region_and_channel(ctx: PaymentContext, package: Package, s: Settings) -> None:
     """Hard gate: the catalogue must be TWD and MyCard must be live upstream."""
-    cur = (package.currency or ctx.currency or "").upper()
-    if cur != s.expected_currency.upper():
-        raise RegionCurrencyMismatchError(s.expected_currency, cur or "unknown")
+    # Both the package and the current checkout context must agree. A stale
+    # TWD package must never hide a THB checkout context.
+    for cur in (package.currency, ctx.currency):
+        if cur and cur.upper() != s.expected_currency.upper():
+            raise RegionCurrencyMismatchError(s.expected_currency, cur.upper())
+    if not package.currency and not ctx.currency:
+        raise RegionCurrencyMismatchError(s.expected_currency, "unknown")
+    if ctx.country and ctx.country.upper() != s.region:
+        raise RegionCurrencyMismatchError(s.expected_currency, "country=" + ctx.country.upper())
     if s.payment_channel_id.lower() not in [c.lower() for c in ctx.channels]:
         raise PaymentChannelUnavailableError(s.payment_channel_id)
 
@@ -139,7 +146,7 @@ class MockStore(Store):
         return list(_MOCK_PACKAGES)
 
     async def payment_context(self, server: str, openid: str | None = None) -> PaymentContext:
-        return PaymentContext(currency=self.s.expected_currency, channels=[self.s.payment_channel_id])
+        return PaymentContext(currency=self.s.expected_currency, channels=[self.s.payment_channel_id], country="TW")
 
     async def dispatch_order(
         self, character: CharacterInfo, package: Package, quantity: int, idem_key: str
@@ -178,8 +185,8 @@ class LiveStore(Store):
             data = await client.store_init(server, openid)
         cfg = (data.get("config") or {}).get("data") or {}
         currency = cfg.get("currency") or ""
+        ipc = (data.get("get_ip_currency") or {}).get("data") or {}
         if not currency:
-            ipc = (data.get("get_ip_currency") or {}).get("data") or {}
             currency = ipc.get("currency") or ""
         channels_raw = (data.get("channels") or {}).get("data") or []
         channels = [
@@ -187,7 +194,7 @@ class LiveStore(Store):
             for c in channels_raw
             if (c.get("channel_id") or c.get("channel"))
         ]
-        return PaymentContext(currency=currency, channels=channels)
+        return PaymentContext(currency=currency, channels=channels, country=ipc.get("country") or cfg.get("country") or "")
 
     async def dispatch_order(
         self, character: CharacterInfo, package: Package, quantity: int, idem_key: str

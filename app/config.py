@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # --- Upstream Aniimo (FunPlus / Kingsgroup) hosts -----------------------
     store_api_base: str = "https://worldx-store-coin.kingsgroupgames.com"
-    account_api_base: str = "https://worldx-store-account.kingsgroupgames.com"
+    account_api_base: str = "https://worldx-office-api.aniimo.com"
 
     # Common request envelope. These are NOT secrets — they are baked into the
     # public web bundle (game_id 999002 = worldx_global).
@@ -52,8 +52,12 @@ class Settings(BaseSettings):
     partner_api_key: str | None = None
 
     # Session provider (only used when role_provider == "session").
-    # A store-account session cookie captured after an OTP login with the dev
-    # account. Lets the service read that account's own roles via /api/player/roles.
+    # The office API uses an operator-owned Bearer credential after login.
+    # It reads only that account's roles; it is not an arbitrary UID lookup.
+    # Bearer credential from an operator-owned test session; never a public
+    # request parameter and never checked into source control.
+    account_bearer_token: SecretStr | None = None
+    # Deprecated compatibility setting. Only sent when explicitly configured.
     account_session_cookie: str | None = None
 
     # --- Resilience knobs ----------------------------------------------------

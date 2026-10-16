@@ -5,18 +5,29 @@
     "description": "UID-based top-up service for the Aniimo webshop (Taiwan / TWD / MyCard)."
   },
   "variable": [
-    { "key": "base", "value": "http://localhost:8000" }
+    {
+      "key": "base",
+      "value": "http://localhost:8000"
+    }
   ],
   "item": [
     {
       "name": "Health",
-      "request": { "method": "GET", "url": "{{base}}/health" }
+      "request": {
+        "method": "GET",
+        "url": "{{base}}/health"
+      }
     },
     {
       "name": "Verify UID",
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
         "url": "{{base}}/api/v1/aniimo/verify",
         "body": {
           "mode": "raw",
@@ -28,7 +39,12 @@
       "name": "Verify UID - unknown (404)",
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
         "url": "{{base}}/api/v1/aniimo/verify",
         "body": {
           "mode": "raw",
@@ -47,13 +63,198 @@
       "name": "Create order (MyCard)",
       "request": {
         "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
         "url": "{{base}}/api/v1/aniimo/order",
         "body": {
           "mode": "raw",
           "raw": "{\n  \"uid\": \"412000126173\",\n  \"server\": \"4\",\n  \"package_id\": \"290002\",\n  \"quantity\": 1\n}"
         }
       }
+    },
+    {
+      "name": "Verification scope tests (mock mode)",
+      "item": [
+        {
+          "name": "Valid mock character",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"412000126173\",\n  \"server\": \"4\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid UID format",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"abc\",\n  \"server\": \"4\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 422\", () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid Server format",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"412000126173\",\n  \"server\": \"abc\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 422\", () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Mock UID absent",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"999999999\",\n  \"server\": \"4\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"Error code\", () => pm.expect(pm.response.json().error.code).to.eql(\"UID_NOT_FOUND\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Session account tests (set base to localhost:8002)",
+      "item": [
+        {
+          "name": "Operator-owned test character",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"412001104638\",\n  \"server\": \"4\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Synthetic unmatched UID is account-scoped",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": \"999999999\",\n  \"server\": \"4\"\n}"
+            },
+            "url": "{{base}}/api/v1/aniimo/verify"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"Error code\", () => pm.expect(pm.response.json().error.code).to.eql(\"UID_NOT_IN_ACCOUNT\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

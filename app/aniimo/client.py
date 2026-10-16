@@ -21,6 +21,7 @@ import httpx
 
 from app.config import Settings
 from app.errors import (
+    AccountAuthenticationError,
     CaptchaRequiredError,
     IpBlockedError,
     OrderResultUnknownError,
@@ -74,7 +75,7 @@ class AniimoClient:
             "game_id": self.s.game_id,
             "game_project": self.s.game_project,
             "source": self.s.source,
-            "server_id": server_id,
+            "server_id": int(server_id),
         }
         if extra:
             body.update(extra)
@@ -175,13 +176,17 @@ class AniimoClient:
     ) -> dict:
         # Non-idempotent: a read timeout must not trigger an automatic resend.
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
-        return await self._post(
+        data = await self._post(
             self.s.store_api_base,
             "/api/place_order",
             self._envelope(server_id, order),
             idempotent=False,
             headers=headers,
         )
+        # Store transport removes the outer envelope. The frontend then reads
+        # the inner business response's data for the actual order payload.
+        inner = data.get("data")
+        return inner if isinstance(inner, dict) else data
 
     async def preload_order(self, server_id: str | int, order: dict) -> dict:
         return await self._post(
@@ -189,8 +194,48 @@ class AniimoClient:
         )
 
     # -- account endpoints (session-bridged) --------------------------------
-    async def player_roles(self, session_cookie: str) -> dict:
+    async def player_roles(self, session_cookie: str | None = None) -> dict:
+        """Office account API has a different envelope from the store API.
+
+        Observed contract: GET, Authorization: Bearer, code=200, data.roles.
+        Do not relax store code=0 handling to accommodate this endpoint.
+        """
         assert self._client is not None
+        headers = {}
+        if self.s.account_bearer_token:
+            token = self.s.account_bearer_token.get_secret_value().strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        if session_cookie:
+            headers["Cookie"] = session_cookie
+        if not headers:
+            raise AccountAuthenticationError()
         url = self.s.account_api_base.rstrip("/") + "/api/player/roles"
-        resp = await self._client.get(url, headers={"Cookie": session_cookie})
-        return self._unwrap(resp)
+        try:
+            resp = await self._client.get(url, headers=headers)
+        except httpx.HTTPError:
+            raise UpstreamUnavailableError("Account service request failed.") from None
+        if resp.status_code in (401, 403):
+            raise AccountAuthenticationError()
+        if resp.status_code == 429 or resp.status_code >= 500:
+            return self._unwrap(resp)
+        if resp.status_code != 200:
+            raise UpstreamUnavailableError("Unexpected account service HTTP status.")
+        try:
+            body = resp.json()
+        except ValueError:
+            raise UpstreamUnavailableError("Account service returned invalid JSON.") from None
+        if not isinstance(body, dict):
+            raise UpstreamUnavailableError("Invalid account service envelope.")
+        if body.get("code") in (401, 403):
+            raise AccountAuthenticationError()
+        if body.get("code") == 429:
+            raise RateLimitedError(upstream=True)
+        if body.get("code") != 200:
+            raise UpstreamBusinessError(body.get("code"), "Account service rejected the lookup.")
+        data = body.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("roles"), list):
+            raise UpstreamUnavailableError("Invalid account roles response.")
+        return data

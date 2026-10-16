@@ -13,7 +13,7 @@ class VerifyRequest(BaseModel):
     @classmethod
     def _uid_numeric(cls, v: str) -> str:
         v = v.strip()
-        if not v.isdigit() or not (4 <= len(v) <= 20):
+        if not v.isascii() or not v.isdigit() or not (4 <= len(v) <= 20):
             raise ValueError("uid must be 4-20 digits")
         return v
 
@@ -21,7 +21,7 @@ class VerifyRequest(BaseModel):
     @classmethod
     def _server_clean(cls, v: str) -> str:
         v = v.strip()
-        if not v.isdigit() or not (1 <= len(v) <= 6):
+        if not v.isascii() or not v.isdigit() or not (1 <= len(v) <= 6) or int(v) < 1:
             raise ValueError("server must be a small positive integer")
         return v
 
@@ -69,6 +69,9 @@ class PackagesResponse(BaseModel):
     currency: str
     payment_channel: str
     packages: list[Package]
+    country: str | None = None
+    mycard_available: bool | None = None
+    checkout_ready: bool | None = None
 
 
 # --- /order ----------------------------------------------------------------
@@ -87,7 +90,7 @@ class CreateOrderRequest(BaseModel):
     @classmethod
     def _uid_numeric(cls, v: str) -> str:
         v = v.strip()
-        if not v.isdigit() or not (4 <= len(v) <= 20):
+        if not v.isascii() or not v.isdigit() or not (4 <= len(v) <= 20):
             raise ValueError("uid must be 4-20 digits")
         return v
 
@@ -95,7 +98,7 @@ class CreateOrderRequest(BaseModel):
     @classmethod
     def _server_clean(cls, v: str) -> str:
         v = v.strip()
-        if not v.isdigit() or not (1 <= len(v) <= 6):
+        if not v.isascii() or not v.isdigit() or not (1 <= len(v) <= 6) or int(v) < 1:
             raise ValueError("server must be a small positive integer")
         return v
 

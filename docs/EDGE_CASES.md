@@ -9,7 +9,9 @@ to a stable JSON contract:
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `UID_NOT_FOUND` | 404 | No character for UID/server |
+| `UID_NOT_FOUND` | 404 | No character in the provider data source |
+| `UID_NOT_IN_ACCOUNT` | 404 | UID/server is not visible in the connected account; global existence unverified |
+| `ACCOUNT_AUTH_REQUIRED` | 502 | Upstream operator credential expired/rejected |
 | `SERVER_INVALID` | 422 | Unknown/unsupported server (format or value) |
 | `PRODUCT_NOT_FOUND` | 404 | package_id not in the live catalogue (distinct from bad server) |
 | `REGION_CURRENCY_MISMATCH` | 409 | Catalogue not priced in TWD (needs a Taiwan egress) |
@@ -103,10 +105,9 @@ A `place_order` success is only reported when the response carries a valid
 ## IP blocking / geo
 
 - Upstream currency is IP-derived and TW pricing needs a Taiwan egress. Route
-  outbound calls through `ANIIMO_OUTBOUND_PROXY` (TW proxy pool). Rotate proxies
-  on repeated `IP_BLOCKED` to avoid a single IP getting flagged.
+  outbound calls through `ANIIMO_OUTBOUND_PROXY` (TW proxy pool). Do not rotate proxies to evade upstream blocks.
 - A `403` from upstream is treated as `IP_BLOCKED` so the caller/ops can react
-  (rotate egress) instead of retrying blindly.
+  (pause and investigate access) instead of retrying blindly.
 
 ## CAPTCHA / risk challenge
 
@@ -114,8 +115,8 @@ A `place_order` success is only reported when the response carries a valid
   HTML or a CAPTCHA interstitial (detected by non-JSON content-type +
   `captcha`/`verify`/`<html`), we fail fast with `CAPTCHA_REQUIRED` (423)
   rather than trying to solve it. Mitigations: keep request volume under the
-  risk threshold, warm sessions, reuse the ShuMei device token from a real
-  browser session, and fall back to a partner API that is not CAPTCHA-gated.
+  risk threshold, use the official interactive flow when authorized, or request an approved
+  publisher integration. Do not automate challenge bypass.
 - A **circuit breaker** (`app/ratelimit.py::CircuitBreaker`) opens after N
   consecutive upstream failures and cools down, so a CAPTCHA wall or outage
   doesn't amplify into a request storm.
@@ -124,7 +125,7 @@ A `place_order` success is only reported when the response carries a valid
 
 - Format validation at the edge (pydantic): UID must be 4–20 digits.
 - Semantic validation by the `RoleProvider`: unknown UID → `UID_NOT_FOUND`.
-- Unknown `package_id` for the server → `SERVER_INVALID`.
+- Unknown `package_id` for the server → `PRODUCT_NOT_FOUND`.
 
 ## Order safety
 
@@ -132,3 +133,11 @@ A `place_order` success is only reported when the response carries a valid
 - Risk codes (e.g. `106042`) are surfaced as `RISK_CONTROL_BLOCK` (409), not
   retried.
 - The order is openid-bound and never carries a customer password.
+
+
+## Verification scope
+
+Session verification lists the operator account roles and matches uid/server.
+An unmatched role is UID_NOT_IN_ACCOUNT, not proof that a global character does
+not exist. Mock data is illustrative and labelled. Verify runs behind the read
+circuit breaker and inbound limiter. See VERIFICATION_EVIDENCE.md for proof.

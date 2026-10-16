@@ -6,3 +6,10 @@ venv/
 .pytest_cache/
 order_state.db
 *.db
+
+# Runtime state and local credentials
+*.db
+*.db-shm
+*.db-wal
+.env.*
+!.env.example

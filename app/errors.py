@@ -154,6 +154,26 @@ class MockDataInLiveModeError(AniimoError):
         )
 
 
+class AccountAuthenticationError(AniimoError):
+    """The operator's upstream credential is missing, expired or rejected."""
+
+    def __init__(self):
+        super().__init__(
+            code="ACCOUNT_AUTH_REQUIRED",
+            message="Operator account authentication was rejected or expired. Renew the server-side credential.",
+            http_status=502,
+        )
+
+
+class UidNotInAccountError(InvalidUidError):
+    """Account-scoped lookup cannot establish whether the UID exists globally."""
+
+    def __init__(self, uid: str, server: str):
+        super().__init__(uid, server)
+        self.code = "UID_NOT_IN_ACCOUNT"
+        self.message = "UID/server is not among the connected account's roles. Global existence is not verified."
+
+
 # --- Anti-abuse / upstream protections -------------------------------------
 class RateLimitedError(AniimoError):
     def __init__(self, retry_after: int = 60, *, upstream: bool = False):
